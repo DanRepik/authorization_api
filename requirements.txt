@@ -1,0 +1,22 @@
+
+pulumi
+pulumi-aws
+cloud-foundry
+
+# testing
+pulumi-automation
+pytest
+pytest-cov
+requests
+boto3
+dotenv
+jwt
+-e .
+
+# packaging
+flit
+pre-commit
+flake8
+black
+build
+twine

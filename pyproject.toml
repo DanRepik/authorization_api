@@ -1,0 +1,34 @@
+# src/pyproject.toml
+
+[build-system]
+requires = ["flit-core>=3.2"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "authorization-api"
+version = "0.0.1"
+authors = [
+    { name = "Daniel Repik", email = "danrepik@icloud.com" }
+]
+description = "A Pulumi component for deploying a secure, fully managed AWS Cognito-backed authorization REST API with Lambda and API Gateway."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = [
+    "pulumi",
+    "pulumi-aws",
+    "boto3",
+]
+classifiers = [
+    "Programming Language :: Python :: 3.9",
+    "Operating System :: OS Independent",
+]
+urls = { "Documentation" = "https://github.com/DanRepik/cloud-foundry", "Source" = "https://github.com/DanRepik/cloud-foundry" }
+
+[tool.pytest.ini_options]
+pythonpath = [".."]
+testpaths = ["tests"]
+markers = [
+    "unit: marks tests as unit tests that do not require a database",
+    "integration: marks tests that operate on a real database",
+]

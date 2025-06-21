@@ -1,0 +1,373 @@
+openapi: 3.0.0
+info:
+  title: Authorization Services API
+  description: API for basic authorization services including signup, login, logout, token refresh, and user removal.
+  version: 1.0.0
+paths:
+  /users:
+    post:
+      summary: Create a new user (signup)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+      responses:
+        '201':
+          description: Signup successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Signup successful
+        '400':
+          description: Signup failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: An error occurred
+  /users/{username}:
+    get:
+      summary: Get user info (admin only)
+      description: Retrieve information about the specified user. Admin only.
+      security:
+        - auth: []
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User information retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  username:
+                    type: string
+                    example: johndoe
+                  email:
+                    type: string
+                    example: johndoe@example.com
+                  groups:
+                    type: array
+                    items:
+                      type: string
+                    example: ["admin", "user"]
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: User not found
+    delete:
+      summary: Remove the user
+      description: Remove the user identified by the username.
+      security:
+        - auth: []
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User removal successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: User removed successfully
+        '400':
+          description: User removal failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: An error occurred
+  /users/me:
+    get:
+      summary: Get authenticated user info
+      description: Retrieve information about the currently authenticated user.
+      security:
+        - auth: []
+      responses:
+        '200':
+          description: User information retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  username:
+                    type: string
+                    example: johndoe
+                  email:
+                    type: string
+                    example: johndoe@example.com
+    delete:
+      summary: Remove the authenticated user
+      description: Remove the currently authenticated user.
+      security:
+        - auth: []
+      responses:
+        '200':
+          description: User removal successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: User removed successfully
+        '400':
+          description: User removal failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: An error occurred
+  /users/me/password:
+    put:
+      summary: Change password for the authenticated user
+      description: Change the password for the user identified by the authentication token.
+      security:
+        - auth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                new_password:
+                  type: string
+                  example: NewPassword456!
+                old_password:
+                  type: string
+                  example: OldPassword456!
+      responses:
+        '200':
+          description: Password changed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Password changed successfully
+        '400':
+          description: Password change failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Password change failed
+  /users/{username}/groups:
+    put:
+      summary: Replace all groups for a user
+      description: Replace the group memberships for the specified user. Admin only.
+      security:
+        - auth: []
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                groups:
+                  type: array
+                  items:
+                    type: string
+                  example: ["admin", "user"]
+      responses:
+        '200':
+          description: Groups updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Groups updated successfully
+        '400':
+          description: Update failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Update failed
+  /sessions:
+    post:
+      summary: Login (create a session)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id_token:
+                    type: string
+                    example: eyJraWQiOiJr...
+                  access_token:
+                    type: string
+                    example: eyJraWQiOiJr...
+                  refresh_token:
+                    type: string
+                    example: eyJraWQiOiJr...
+        '400':
+          description: Login failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: An error occurred
+  /sessions/me:
+    delete:
+      summary: Logout (delete a session)
+      security:
+        - auth: []
+      responses:
+        '204':
+          description: Logout successful
+        '400':
+          description: Logout failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: An error occurred
+  /sessions/refresh:
+    post:
+      summary: Refresh tokens
+      description: Refresh the access token and optionally the refresh token using the provided refresh token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: Token refresh successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshTokenResponse'
+        '400':
+          description: Token refresh failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: An error occurred
+components:
+  schemas:
+    SignupRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          example: johndoe
+        password:
+          type: string
+          example: Password123!
+        email:
+          type: string
+          example: johndoe@example.com
+        nickName:
+          type: string
+          example: Jon D
+    LoginRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          example: johndoe
+        password:
+          type: string
+          example: Password123!
+    RefreshTokenRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          example: johndoe
+        refresh_token:
+          type: string
+          example: eyJraWQiOiJr...
+    RefreshTokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          example: eyJraWQiOiJr...
+        id_token:
+          type: string
+          example: eyJraWQiOiJr...
+        refresh_token:
+          type: string
+          example: eyJraWQiOiJr...
+        groups:
+          type: array
+          items:
+            type: string
+          example: ["admin", "user"]
