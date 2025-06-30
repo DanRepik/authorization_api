@@ -26,7 +26,6 @@ classifiers = [
 urls = { "Documentation" = "https://github.com/DanRepik/cloud-foundry", "Source" = "https://github.com/DanRepik/cloud-foundry" }
 
 [tool.pytest.ini_options]
-pythonpath = [".."]
 testpaths = ["tests"]
 markers = [
     "unit: marks tests as unit tests that do not require a database",

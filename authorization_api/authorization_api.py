@@ -1,4 +1,3 @@
-import os
 import pulumi
 import pulumi_aws as aws
 from dotenv import load_dotenv
@@ -21,26 +20,17 @@ class AuthorizationAPI(pulumi.ComponentResource):
         super().__init__("cloud_foundry:api:SecurityAPI", name, {}, opts)
         source_dir = "./tests/resources/security_services"
 
-        # Helper to get region/account/user pool
-        region = os.getenv("AWS_REGION") or aws.get_region().name
-        account_id = os.getenv("AWS_ACCOUNT_ID") or aws.get_caller_identity().account_id
-
-        def get_issuer():
-            if not user_pool_id:
-                raise ValueError("user_pool_id environment variable is not set.")
-            return pulumi.Output.concat(
-                "https://cognito-idp.", region, ".amazonaws.com/", user_pool_id
-            )
+        user_pool = aws.cognito.UserPool.get(user_pool_id)
 
         # Security Lambda
         self.security_function = cloud_foundry.python_function(
             "security-function",
-            sources={"app.py": f"{source_dir}/security_lambda.py"},
+            sources={"app.py": f"{source_dir}/authorization_lambda.py"},
             environment={
                 "CLIENT_ID": client_id,
                 "USER_POOL_ID": user_pool_id,
                 "CLIENT_SECRET": client_secret,
-                "ISSUER": get_issuer(),
+                "ISSUER": user_pool.endpoint,
                 "LOGGING_LEVEL": "DEBUG",
                 "USER_ADMIN_GROUP": user_admin_group,
                 "USER_DEFAULT_GROUP": user_default_group,
@@ -63,16 +53,7 @@ class AuthorizationAPI(pulumi.ComponentResource):
                         "cognito-idp:AdminUpdateUserAttributes",
                         "cognito-idp:GetJWKS",
                     ],
-                    "Resources": [
-                        pulumi.Output.concat(
-                            "arn:aws:cognito-idp:",
-                            region,
-                            ":",
-                            account_id,
-                            ":userpool/",
-                            user_pool_id,
-                        )
-                    ],
+                    "Resources": [ user_pool.arn ],
                 }
             ],
             opts=pulumi.ResourceOptions(parent=self),
@@ -83,7 +64,7 @@ class AuthorizationAPI(pulumi.ComponentResource):
             "token-validator",
             sources={"app.py": f"{source_dir}/token_validator.py"},
             requirements=["pyjwt", "requests", "cryptography"],
-            environment={"ISSUER": get_issuer()},
+            environment={"ISSUER": user_pool.endpoint},
             opts=pulumi.ResourceOptions(parent=self),
         )
 

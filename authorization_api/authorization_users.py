@@ -2,14 +2,33 @@ import pulumi_aws as aws
 from pulumi import ComponentResource, ResourceOptions
 from cloud_foundry.utils.names import resource_id
 
+cognito_attributes = ["email", "phone_number", "preferred_username", "name", "given_name", "family_name", "middle_name", "nickname", "address", "birthdate", "gender", "locale", "picture", "profile", "updated_at", "website", "zoneinfo", "username"]
 
-class UserPool(ComponentResource):
+default_attributes = [
+    {
+        "name": "username",
+        "attribute_data_type": "String",
+        "mutable": True,
+        "required": True,
+        "string_constraints": {"min_length": "3", "max_length": "50"}
+    },
+    {
+        "name": "nickName",
+        "attribute_data_type": "String",
+        "mutable": True,
+        "required": False,
+    }
+]
+
+
+
+class AuthorizationUsers(ComponentResource):
     def __init__(
         self,
         name,
         attributes: list[str] = None,
-        password_policy: dict = None,
         groups: list = None,
+        password_policy: dict = None,
         email_message: str = None,
         email_subject: str = None,
         opts=None,
@@ -23,12 +42,14 @@ class UserPool(ComponentResource):
             auto_verified_attributes=["email"],  # Auto-verify emails
             schemas=[
                 {
-                    "name": attr,
-                    "attribute_data_type": "String",
-                    "mutable": True,
-                    "required": False,
+                    "name": attr.get("name") if attr.get("name") in cognito_attributes else f"custom:{attr.get('name')}", 
+                    "attribute_data_type": attr.get("attribute_data_type", "String"),
+                    "mutable": attr.get("mutable", True),
+                    "required": attr.get("required", False),
+                    **(attr.get("string_constraints", {}) if attr.get("attribute_data_type") == "String" else {}),
+                    **(attr.get("number_constraints", {}) if attr.get("attribute_data_type") == "Number" else {})
                 }
-                for attr in attributes or []
+                for attr in (attributes if attributes is not None else default_attributes)
             ],
             password_policy=password_policy or {
                 "minimum_length": 8,
@@ -76,6 +97,7 @@ class UserPool(ComponentResource):
 
         self.arn = user_pool.arn
         self.id = user_pool.id
+        self.endpoint = user_pool.endpoint
         self.client_id = user_pool_client.id
         self.client_secret = user_pool_client.client_secret
 
@@ -83,6 +105,7 @@ class UserPool(ComponentResource):
             {
                 "id": self.id,
                 "arn": self.arn,
+                "endpoint": self.endpoint,
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
             }

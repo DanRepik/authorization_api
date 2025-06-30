@@ -8,10 +8,8 @@ import urllib.parse
 from tests.automation_helpers import deploy_stack, deploy_stack_no_teardown
 from typing import Dict
 import boto3
-import os
 import contextlib
-import time
-from cloud_foundry import AuthorizationAPI, UserPool  # noqa: F401
+from authorization_api import AuthorizationAPI, AuthorizationUsers
 
 log = logging.getLogger(__name__)
 dotenv.load_dotenv()
@@ -19,10 +17,20 @@ dotenv.load_dotenv()
 
 def security_services_pulumi():
     def pulumi_program():
-        user_pool = UserPool(
+
+        authorization_users = AuthorizationUsers(
             "security-user-pool",
             self_serve=True,
-            attributes=["username", "nickName"],
+            attributes=[
+                {
+                    "name": "username",
+                    "required": True,
+                    "string_constraints": {"min_length": "3", "max_length": "50"}
+                },
+                {
+                    "name": "nickName",
+                }
+            ],
             groups=[
                 {"description": "Admins group", "role": "admin"},
                 {"description": "Manager group", "role": "manager"},
@@ -31,15 +39,31 @@ def security_services_pulumi():
         )
         security_api = AuthorizationAPI(
             "security-api",
-            client_id=user_pool.client_id,
-            user_pool_id=user_pool.id,
-            client_secret=user_pool.client_secret,
+            client_id=authorization_users.client_id,
+            user_pool_id=authorization_users.id,
+            client_secret=authorization_users.client_secret,
             user_admin_group="admin",
             user_default_group="member",
-        )
+            attributes=[
+                {
+                    "name": "username",
+                    "required": True,
+                    "string_constraints": {"min_length": "3", "max_length": "50"}
+                },
+                {
+                    "name": "nickName",
+                }
+            ],
+            groups=[
+                {"description": "Admins group", "role": "admin"},
+                {"description": "Manager group", "role": "manager"},
+                {"description": "Member group", "role": "member"},
+            ],
+            region=authorization_users.region,
+            account_id=authorization_users.account_id)
 
         log.info("Security API and User Pool created successfully.")
-        pulumi.export("security-user-pool-id", user_pool.id)
+        pulumi.export("security-user-pool-id", authorization_users.id)
         pulumi.export("security-api-host", security_api.domain)
         pulumi.export("token-validator", security_api.token_validator.function_name)
 

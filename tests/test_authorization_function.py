@@ -8,10 +8,10 @@ import uuid
 import json
 import pulumi
 import urllib.parse
-from cloud_foundry import UserPool
-from cloud_foundry import AuthorizationServices
+from authorization_api import AuthorizationUsers
+from authorization_api.authorization_lambda import AuthorizationServices
 
-from tests.automation_helpers import deploy_stack
+from tests.automation_helpers import deploy_stack, deploy_stack_no_teardown
 
 log = logging.getLogger(__name__)
 dotenv.load_dotenv()
@@ -19,9 +19,8 @@ dotenv.load_dotenv()
 
 def user_pool_pulumi():
     def pulumi_program():
-        user_pool = UserPool(
+        user_pool = AuthorizationUsers(
             "security-user-pool",
-            self_serve=True,
             attributes=["username", "nickName"],
             groups=[
                 {"description": "Admins group", "role": "admin"},
@@ -40,7 +39,7 @@ def user_pool_pulumi():
 @pytest.fixture(scope="module")
 def user_pool_stack():
     log.info("Starting deployment of security services stack")
-    yield from deploy_stack("cf", "security-func", user_pool_pulumi())
+    yield from deploy_stack_no_teardown("test", "security-func", user_pool_pulumi())
 
 
 @pytest.fixture(scope="module")

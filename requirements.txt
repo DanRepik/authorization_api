@@ -1,7 +1,8 @@
 
 pulumi
 pulumi-aws
-cloud-foundry
+-e ../cloud_foundry
+
 
 # testing
 pulumi-automation
