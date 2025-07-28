@@ -17,33 +17,52 @@ log.setLevel(os.environ.get("LOGGING_LEVEL", "INFO"))
 cognito_client = boto3.client("cognito-idp")
 
 
+def load_json_from_parameter_store(param_name):
+    """
+    Loads a JSON object from an AWS SSM Parameter Store item.
+    """
+    ssm = boto3.client("ssm", region_name=os.environ.get("AWS_REGION"))
+    try:
+        response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+        value = response["Parameter"]["Value"]
+        return json.loads(value)
+    except ClientError as e:
+        log.error(f"Error loading parameter {param_name}: {e.response['Error']['Message']}")
+        raise
+
+config = None 
+
 def handler(event, context):
+
     log.info(f"Received event: {event}")
-    auth_service = AuthorizationServices()
+    auth_service = AuthorizationServices(**config)
     return auth_service.handler(event, context)
 
 
 class AuthorizationServices:
     def __init__(
         self,
-        user_pool_id=None,
-        client_id=None,
-        client_secret=None,
-        user_admin_group=None,
-        user_default_group=None,
+        client_config_name: str=None,
         region=None,
     ):
-        self.user_pool_id = user_pool_id or os.getenv("USER_POOL_ID")
-        self.client_id = client_id or os.getenv("CLIENT_ID")
-        self.client_secret = client_secret or os.getenv("CLiENT_SECRET")
-        self.user_admin_group = user_admin_group or os.getenv("USER_ADMIN_GROUP")
-        self.user_default_group = user_default_group or os.getenv("USER_DEFAULT_GROUP")
+        global config
+        if not config:
+            log.info("Loading configuration from Parameter Store")
+            # Load the configuration from AWS SSM Parameter Store
+            config = load_json_from_parameter_store(client_config_name or os.environ.get("CONFIG_PARAMETER"))
+
+        self.user_pool_id = config.get("user_pool_id") or os.getenv("USER_POOL_ID")
+        self.client_id = config.get("client_id") or os.getenv("CLIENT_ID")
+        self.client_secret = config.get("client_secret") or os.getenv("CLiENT_SECRET")
+        self.user_admin_group = config.get("user_admin_group") or os.getenv("USER_ADMIN_GROUP")
+        self.user_default_group = config.get("user_default_group") or os.getenv("USER_DEFAULT_GROUP")
+        self.admin_emails = config.get("admin_emails", [])
         self.region = region or os.getenv("AWS_REGION", "us-east-1")
         self.issuer = (
             region
             or f"https://cognito-idp.{self.region}.amazonaws.com/{self.user_pool_id}"
         )
-        self.cognito_client = boto3.client("cognito-idp", region_name=region)
+        self.attributes = config.get("attributes", None)
 
     def handler(self, event, context):
         log.info(f"event: {event}")
@@ -55,6 +74,8 @@ class AuthorizationServices:
             return self.create_user(event)
         elif path.endswith("/users/{username}") and http_method == "GET":
             return self.get_user(event)
+        elif path.endswith("/users/confirm") and http_method == "POST":
+            return self.confirm_user(event)
         elif path.endswith("/users/{username}") and http_method == "DELETE":
             return self.delete_user(event)
         elif path.endswith("/users/me/password") and http_method == "PUT":
@@ -81,20 +102,27 @@ class AuthorizationServices:
 
         try:
 
+            # Compile UserAttributes from the body using self.attributes
+            user_attributes = []
+            missing_required = []
+            for attr in self.attributes or []:
+                attr_name = attr.get("name")
+                required = attr.get("required", False)
+                value = body.get(attr_name)
+                if required and (value is None or value == ""):
+                    missing_required.append(attr_name)
+                if value is not None:
+                    user_attributes.append({"Name": attr_name, "Value": str(value)})
+            if missing_required:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"message": f"Missing required attributes: {', '.join(missing_required)}"}),
+                }
+
             cognito_client.admin_create_user(
                 UserPoolId=self.user_pool_id,
                 Username=username,
-                UserAttributes=[
-                    {
-                        "name": attr.get("name", "customAttribute"),
-                        "attribute_data_type": attr.get("attribute_data_type", "String"),
-                        "mutable": attr.get("mutable", True),
-                        "required": attr.get("required", False),
-                        **(attr.get("string_constraints", {}) if attr.get("attribute_data_type") == "String" else {}),
-                        **(attr.get("number_constraints", {}) if attr.get("attribute_data_type") == "Number" else {})
-                    }
-                    for attr in (attributes if attributes is not None else default_attributes)
-                ],
+                UserAttributes=user_attributes,
                 TemporaryPassword=password,
                 MessageAction="SUPPRESS",
             )
@@ -115,6 +143,16 @@ class AuthorizationServices:
                     GroupName=self.user_default_group,
                 )
 
+            # Add user to admin group if their email is in admin_emails
+            user_email = body.get("email") or username
+            if self.user_admin_group and user_email and self.admin_emails and user_email in self.admin_emails:
+                log.info(f"Adding user {username} to admin group {self.user_admin_group}")
+                cognito_client.admin_add_user_to_group(
+                    UserPoolId=self.user_pool_id,
+                    Username=username,
+                    GroupName=self.user_admin_group,
+                    )
+                
             return {
                 "statusCode": 201,
                 "body": json.dumps({"message": "Signup successful"}),
@@ -206,11 +244,31 @@ class AuthorizationServices:
         log.info(f"request_context: {request_context}")
         log.info(f"body: {body}")
         username = request_context.get("authorizer", {}).get("username")
+        old_password = body.get("old_password")
         new_password = body.get("new_password")
 
         log.info(
-            f"Changing password for user: {username}, new_password: {new_password}"
+            f"Changing password for user: {username}, old_password: {old_password}, new_password: {new_password}"
         )
+        try:
+            # Authenticate the user with the old password to verify it is correct
+            secret_hash = self.calculate_secret_hash(username)
+            cognito_client.initiate_auth(
+                AuthFlow="USER_PASSWORD_AUTH",
+                AuthParameters={
+                    "USERNAME": username,
+                    "PASSWORD": old_password,
+                    "SECRET_HASH": secret_hash,
+                },
+                ClientId=self.client_id,
+            )
+        except ClientError as e:
+            log.error(f"Old password verification failed: {e.response}")
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": "Old password is incorrect"}),
+            }
+
         try:
             cognito_client.admin_set_user_password(
                 UserPoolId=self.user_pool_id,
@@ -456,7 +514,7 @@ class AuthorizationServices:
         groups = [group["GroupName"] for group in user_groups.get("Groups", [])]
         log.info(f"User groups: {groups}")
 
-        return attributes, groups
+        return attributes, sorted(groups)
 
     def get_permissions_from_token(self, decoded_token):
         """
@@ -482,3 +540,34 @@ class AuthorizationServices:
             return to_list(decoded_token["cognito:groups"])
         # No permissions found
         return []
+
+    def confirm_user(self, event):
+        """
+        Confirms a user's signup using a confirmation code.
+        Expects 'username' and 'confirmation_code' in the request body.
+        """
+        body = json.loads(event["body"])
+        username = body.get("username")
+        confirmation_code = body.get("confirmation_code")
+
+        if not username or not confirmation_code:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": "Username and confirmation code are required"}),
+            }
+
+        try:
+            cognito_client.confirm_sign_up(
+                ClientId=self.client_id,
+                Username=username,
+                ConfirmationCode=confirmation_code,
+            )
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "User confirmed successfully"}),
+            }
+        except ClientError as e:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": e.response["Error"]["Message"]}),
+            }

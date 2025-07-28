@@ -14,56 +14,25 @@ from authorization_api import AuthorizationAPI, AuthorizationUsers
 log = logging.getLogger(__name__)
 dotenv.load_dotenv()
 
+admin_user_email = f"apitestadmin_{uuid.uuid4()}@example.com"
 
 def security_services_pulumi():
     def pulumi_program():
 
-        authorization_users = AuthorizationUsers(
-            "security-user-pool",
-            self_serve=True,
-            attributes=[
-                {
-                    "name": "username",
-                    "required": True,
-                    "string_constraints": {"min_length": "3", "max_length": "50"}
-                },
-                {
-                    "name": "nickName",
-                }
-            ],
-            groups=[
-                {"description": "Admins group", "role": "admin"},
-                {"description": "Manager group", "role": "manager"},
-                {"description": "Member group", "role": "member"},
-            ],
-        )
         security_api = AuthorizationAPI(
             "security-api",
-            client_id=authorization_users.client_id,
-            user_pool_id=authorization_users.id,
-            client_secret=authorization_users.client_secret,
+            self_serve=True,
             user_admin_group="admin",
             user_default_group="member",
-            attributes=[
-                {
-                    "name": "username",
-                    "required": True,
-                    "string_constraints": {"min_length": "3", "max_length": "50"}
-                },
-                {
-                    "name": "nickName",
-                }
-            ],
+            admin_emails=[admin_user_email],
             groups=[
                 {"description": "Admins group", "role": "admin"},
                 {"description": "Manager group", "role": "manager"},
                 {"description": "Member group", "role": "member"},
-            ],
-            region=authorization_users.region,
-            account_id=authorization_users.account_id)
+            ])
 
         log.info("Security API and User Pool created successfully.")
-        pulumi.export("security-user-pool-id", authorization_users.id)
+        pulumi.export("security-user-pool-id", security_api.user_pool_id)
         pulumi.export("security-api-host", security_api.domain)
         pulumi.export("token-validator", security_api.token_validator.function_name)
 
@@ -73,7 +42,7 @@ def security_services_pulumi():
 @pytest.fixture(scope="module")
 def security_services_stack():
     log.info("Starting deployment of security services stack")
-    yield from deploy_stack("cf", "security", security_services_pulumi())
+    yield from deploy_stack_no_teardown("test-auth-api", "api", security_services_pulumi())
 
 
 @pytest.fixture(scope="module")
@@ -159,7 +128,7 @@ def member_user(domain, user_pool_id):
 @contextlib.contextmanager
 def admin_user(domain, user_pool_id):
     admin_payload = {
-        "username": f"apitestadmin_{uuid.uuid4()}@example.com",
+        "username": admin_user_email,
         "password": "AdminPass1234!",
     }
 

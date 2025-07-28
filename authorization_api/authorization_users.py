@@ -35,22 +35,28 @@ class AuthorizationUsers(ComponentResource):
     ):
         super().__init__("cloud_foundry:user_pool:Domain", name, {}, opts)
 
+        schemas = [
+            aws.cognito.UserPoolSchemaArgs(
+            name=attr.get("name") if attr.get("name") in cognito_attributes else f"custom:{attr.get('name')}",
+            attribute_data_type=attr.get("attribute_data_type", "String"),
+            mutable=attr.get("mutable", True),
+            required=attr.get("required", False),
+            string_attribute_constraints=attr.get("string_constraints") if attr.get("attribute_data_type", "String") == "String" else None,
+            number_attribute_constraints=attr.get("number_constraints") if attr.get("attribute_data_type") == "Number" else None,
+            )
+            for attr in (attributes if attributes is not None else default_attributes)
+        ]
+        print("Creating user pool with attributes:")
+        for schema in schemas:
+            print(vars(schema))
+
+
         # Create Cognito User Pool with custom attributes
         user_pool = aws.cognito.UserPool(
             f"{name}-user-pool",
             name=resource_id(name),
             auto_verified_attributes=["email"],  # Auto-verify emails
-            schemas=[
-                {
-                    "name": attr.get("name") if attr.get("name") in cognito_attributes else f"custom:{attr.get('name')}", 
-                    "attribute_data_type": attr.get("attribute_data_type", "String"),
-                    "mutable": attr.get("mutable", True),
-                    "required": attr.get("required", False),
-                    **(attr.get("string_constraints", {}) if attr.get("attribute_data_type") == "String" else {}),
-                    **(attr.get("number_constraints", {}) if attr.get("attribute_data_type") == "Number" else {})
-                }
-                for attr in (attributes if attributes is not None else default_attributes)
-            ],
+            schemas=schemas,
             password_policy=password_policy or {
                 "minimum_length": 8,
                 "require_uppercase": True,
@@ -82,7 +88,7 @@ class AuthorizationUsers(ComponentResource):
                 "ALLOW_REFRESH_TOKEN_AUTH",
                 "ALLOW_USER_SRP_AUTH",
             ],
-            opts=ResourceOptions(parent=self),
+            opts=ResourceOptions(parent=self, depends_on=[user_pool]),
         )
 
         for group in groups or []:

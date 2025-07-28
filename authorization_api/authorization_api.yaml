@@ -34,6 +34,47 @@ paths:
                   error:
                     type: string
                     example: An error occurred
+  /users/confirm:
+    post:
+      summary: Confirm user signup
+      description: Confirm a user's signup using a confirmation code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+                - confirmation_code
+              properties:
+                username:
+                  type: string
+                  example: johndoe
+                confirmation_code:
+                  type: string
+                  example: "123456"
+      responses:
+        '200':
+          description: User confirmed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: User confirmed successfully
+        '400':
+          description: Confirmation failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Confirmation failed
   /users/{username}:
     get:
       summary: Get user info (admin only)
@@ -253,17 +294,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id_token:
-                    type: string
-                    example: eyJraWQiOiJr...
-                  access_token:
-                    type: string
-                    example: eyJraWQiOiJr...
-                  refresh_token:
-                    type: string
-                    example: eyJraWQiOiJr...
+                $ref: '#/components/schemas/LoginResponse'
         '400':
           description: Login failed
           content:
@@ -319,10 +350,41 @@ paths:
                   message:
                     type: string
                     example: An error occurred
+  /sessions/mfa:
+    post:
+      summary: Respond to MFA challenge
+      description: Submit the MFA code received via SMS or authenticator app.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MfaResponse'
+      responses:
+        '200':
+          description: MFA successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          description: MFA failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: MFA failed
 components:
   schemas:
     SignupRequest:
       type: object
+      required:
+        - username
+        - password
+        - email
       properties:
         username:
           type: string
@@ -332,12 +394,11 @@ components:
           example: Password123!
         email:
           type: string
-          example: johndoe@example.com
-        nickName:
-          type: string
-          example: Jon D
     LoginRequest:
       type: object
+      required:
+        - username
+        - password
       properties:
         username:
           type: string
@@ -345,8 +406,54 @@ components:
         password:
           type: string
           example: Password123!
+    LoginResponse:
+      type: object
+      properties:
+        id_token:
+          type: string
+          example: eyJraWQiOiJr...
+        access_token:
+          type: string
+          example: eyJraWQiOiJr...
+        refresh_token:
+          type: string
+          example: eyJraWQiOiJr...
+
+    MfaResponse:
+      type: object
+      properties:
+        challenge_name:
+          type: string
+          example: SMS_MFA
+        session:
+          type: string
+          example: "session-token-from-cognito"
+        message:
+          type: string
+          example: "Enter the code sent to your phone."
+
+    MfaChallengeResponse:
+      type: object
+      required:
+        - username
+        - session
+        - code
+      properties:
+        username:
+          type: string
+          example: johndoe
+        session:
+          type: string
+          example: "session-token-from-cognito"
+        code:
+          type: string
+          example: "123456"
+
     RefreshTokenRequest:
       type: object
+      required:
+        - username
+        - refresh_token
       properties:
         username:
           type: string
@@ -354,9 +461,6 @@ components:
         refresh_token:
           type: string
           example: eyJraWQiOiJr...
-    RefreshTokenResponse:
-      type: object
-      properties:
         access_token:
           type: string
           example: eyJraWQiOiJr...
