@@ -1,3 +1,4 @@
+from typing import Optional, Dict, List, Any
 import hmac
 import hashlib
 import base64
@@ -16,8 +17,10 @@ log.setLevel(os.environ.get("LOGGING_LEVEL", "INFO"))
 # Initialize the Cognito client
 cognito_client = boto3.client("cognito-idp")
 
+# Configuration for Pre Token Generation
+ENABLE_TOKEN_CUSTOMIZATION = os.environ.get("ENABLE_TOKEN_CUSTOMIZATION", "true").lower() == "true"
 
-def load_json_from_parameter_store(param_name):
+def load_configuration(param_name):
     """
     Loads a JSON object from an AWS SSM Parameter Store item.
     """
@@ -30,33 +33,39 @@ def load_json_from_parameter_store(param_name):
         log.error(f"Error loading parameter {param_name}: {e.response['Error']['Message']}")
         raise
 
-config = None 
+config = None
 
 def handler(event, context):
-
-    log.info(f"Received event: {event}")
-    auth_service = AuthorizationServices(**config)
-    return auth_service.handler(event, context)
+    # Handle regular API Gateway requests
+    auth_service = AuthorizationServices()
+    result = auth_service.handler(event, context)
+    log.info(f"Handler result: {result}")
+    return result
 
 
 class AuthorizationServices:
     def __init__(
         self,
-        client_config_name: str=None,
-        region=None,
+        client_config_name: Optional[str] = None,
+        region: Optional[str] = None,
     ):
         global config
         if not config:
             log.info("Loading configuration from Parameter Store")
             # Load the configuration from AWS SSM Parameter Store
-            config = load_json_from_parameter_store(client_config_name or os.environ.get("CONFIG_PARAMETER"))
+            config = load_configuration(client_config_name or os.environ.get("CONFIG_PARAMETER"))
+            log.info(f"Configuration loaded: {config}")
 
-        self.user_pool_id = config.get("user_pool_id") or os.getenv("USER_POOL_ID")
-        self.client_id = config.get("client_id") or os.getenv("CLIENT_ID")
-        self.client_secret = config.get("client_secret") or os.getenv("CLiENT_SECRET")
-        self.user_admin_group = config.get("user_admin_group") or os.getenv("USER_ADMIN_GROUP")
-        self.user_default_group = config.get("user_default_group") or os.getenv("USER_DEFAULT_GROUP")
-        self.admin_emails = config.get("admin_emails", [])
+        self.user_pool_id = os.getenv("USER_POOL_ID") or config.get("user_pool_id")
+        self.client_id = os.getenv("CLIENT_ID") or config.get("client_id")
+        self.client_secret = os.getenv("CLIENT_SECRET") or config.get("client_secret")
+        self.user_admin_group = os.getenv("USER_ADMIN_GROUP") or config.get("user_admin_group")
+        self.user_default_group = os.getenv("USER_DEFAULT_GROUP") or config.get("user_default_group")
+        self.admin_emails = os.getenv("ADMIN_EMAILS")
+        if self.admin_emails:
+            self.admin_emails = json.loads(self.admin_emails)
+        else:
+            self.admin_emails = config.get("admin_emails", [])
         self.region = region or os.getenv("AWS_REGION", "us-east-1")
         self.issuer = (
             region
@@ -65,7 +74,8 @@ class AuthorizationServices:
         self.attributes = config.get("attributes", None)
 
     def handler(self, event, context):
-        log.info(f"event: {event}")
+        log.info(f"Received event: {event}")
+
         path = event.get("resource", "")
         http_method = event.get("httpMethod", "").upper()
         log.info(f"Path: {path}, HTTP Method: {http_method}")
@@ -82,6 +92,10 @@ class AuthorizationServices:
             return self.change_user_password(event)
         elif path.endswith("/users/{username}/groups") and http_method == "PUT":
             return self.change_user_groups(event)
+        elif path.endswith("/users/{username}/disable") and http_method == "POST":
+            return self.disable_user(event)
+        elif path.endswith("/users/{username}/enable") and http_method == "POST":
+            return self.enable_user(event)
         elif path.endswith("/sessions") and http_method == "POST":
             return self.create_session(event)
         elif path.endswith("/sessions/me") and http_method == "DELETE":
@@ -152,12 +166,15 @@ class AuthorizationServices:
                     Username=username,
                     GroupName=self.user_admin_group,
                     )
-                
+
+            log.info(f"User {username} created successfully")
+            # Return a success response                
             return {
                 "statusCode": 201,
                 "body": json.dumps({"message": "Signup successful"}),
             }
         except ClientError as e:
+            log.error(f"Error creating user: {e.response}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
@@ -498,7 +515,7 @@ class AuthorizationServices:
             }
 
     def fetch_user_info(self, username):
-        # Fetch user attributes
+        # Fetch user attributes and status
         user_details = cognito_client.admin_get_user(
             UserPoolId=self.user_pool_id, Username=username
         )
@@ -506,13 +523,17 @@ class AuthorizationServices:
             attr["Name"]: attr["Value"]
             for attr in user_details.get("UserAttributes", [])
         }
-        log.info(f"User attributes: {attributes}")
+        enabled = user_details.get("Enabled", False)
+        log.info(f"User attributes: {attributes}, Enabled: {enabled}")
         # Get the user's groups
         user_groups = cognito_client.admin_list_groups_for_user(
             UserPoolId=self.user_pool_id, Username=username
         )
         groups = [group["GroupName"] for group in user_groups.get("Groups", [])]
         log.info(f"User groups: {groups}")
+
+        # Include enabled status in the returned attributes
+        attributes["enabled"] = enabled
 
         return attributes, sorted(groups)
 
@@ -571,3 +592,54 @@ class AuthorizationServices:
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
             }
+
+    def disable_user(self, event):
+        permissions = self.get_permissions_from_token(
+            event["requestContext"]["authorizer"]
+        )
+        if self.user_admin_group and self.user_admin_group not in permissions:
+            return {
+                "statusCode": 403,
+                "body": json.dumps({"message": "You are not authorized to disable users"}),
+            }
+        username = unquote(event["pathParameters"]["username"])
+        try:
+            cognito_client.admin_disable_user(
+                UserPoolId=self.user_pool_id,
+                Username=username,
+            )
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "User disabled successfully"}),
+            }
+        except ClientError as e:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": e.response["Error"]["Message"]}),
+            }
+
+    def enable_user(self, event):
+        permissions = self.get_permissions_from_token(
+            event["requestContext"]["authorizer"]
+        )
+        if self.user_admin_group and self.user_admin_group not in permissions:
+            return {
+                "statusCode": 403,
+                "body": json.dumps({"message": "You are not authorized to enable users"}),
+            }
+        username = unquote(event["pathParameters"]["username"])
+        try:
+            cognito_client.admin_enable_user(
+                UserPoolId=self.user_pool_id,
+                Username=username,
+            )
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "User enabled successfully"}),
+            }
+        except ClientError as e:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": e.response["Error"]["Message"]}),
+            }
+    

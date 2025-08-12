@@ -1,4 +1,5 @@
 import json
+from typing import Optional
 import pulumi
 import pulumi_aws as aws
 from dotenv import load_dotenv
@@ -6,6 +7,8 @@ import cloud_foundry
 import logging
 import os
 import boto3
+from .authorization_users import AuthorizationUsers
+from .validation_function import ValidationFunction
 
 load_dotenv()
 
@@ -17,18 +20,12 @@ predefined_attributes = ["email", "phone_number", "preferred_username", "name", 
 default_attributes = [
     {"name": "email", "required": True, "mutable": True},
     {"name": "phone_number", "required": False, "mutable": True},
-    {"name": "given_name", "required": False, "mutable": True},
-    {"name": "family_name", "required": False, "mutable": True},
 ]
 
-
-default_groups = [
-                    {"description": "Admins group", "role": "admin"},
-                    {"description": "Superuser group", "role": "superuser"},
-                    {"description": "User group", "role": "user"},
-                ]
-
-package_dir = "pkg://authorization_api"
+default_groups=[
+    {"description": "Admins group", "role": "admin"},
+    {"description": "Member group", "role": "user"},
+]
 
 default_password_policy = {
     "minimum_length": 8,
@@ -37,6 +34,9 @@ default_password_policy = {
     "require_numbers": True,
     "require_symbols": False,
 }
+
+
+package_dir = "pkg://authorization_api"
 
 class AuthorizationAPI(pulumi.ComponentResource):
     """
@@ -47,6 +47,7 @@ class AuthorizationAPI(pulumi.ComponentResource):
       - AWS Lambda functions for security operations and token validation.
       - A REST API with endpoints for user and session management, integrated with the security Lambda.
       - Secure storage of client secrets and configuration in AWS SSM Parameter Store.
+      - Extraction and removal of role-based security requirements from OpenAPI specifications.
     Args:
         name (str): The base name for resources.
         user_pool_id (Optional[str]): Existing Cognito User Pool ID. If not provided, a new pool is created.
@@ -70,9 +71,8 @@ class AuthorizationAPI(pulumi.ComponentResource):
         domain (str): The domain name of the deployed REST API.
         token_validator (str): The name of the token validator Lambda function.
         user_pool_id (str): The ID of the Cognito User Pool.
+        validation_function (ValidationFunction): The validation function component that handles path roles and token validation.
     Methods:
-        create_user_pool(name, attributes, groups, password_policy, email_message, email_subject, invitation_only):
-            Creates a Cognito User Pool with custom attributes and groups.
         create_client_secret_param(name, client_id, user_pool_id, client_secret, user_pool_endpoint, user_admin_group, user_default_group, admin_emails, attributes):
             Stores client secret and configuration in AWS SSM Parameter Store as a SecureString.
     Example:
@@ -81,6 +81,11 @@ class AuthorizationAPI(pulumi.ComponentResource):
             attributes=[{"name": "department", "attribute_data_type": "String"}],
             groups=[{"role": "admin", "description": "Administrators"}],
             admin_emails=["admin@example.com"]
+        )
+        
+        # Access the role mappings through the validation function component
+        # (Note: This requires using Pulumi's apply method since validation_function is an Output)
+        # validation_function_roles = api.validation_function.apply(lambda vf: vf.path_roles)
     """
     def __init__(
         self,
@@ -89,14 +94,14 @@ class AuthorizationAPI(pulumi.ComponentResource):
         client_id=None,
         client_secret=None,
         attributes=None,
-        groups=None,
-        user_admin_group: str = None,
-        user_default_group: str = None,
-        admin_emails=None,
-        password_policy=None,
-        sms_message=None,
-        email_message=None,
-        email_subject=None,
+        groups: Optional[list[dict]] = None,
+        user_admin_group: Optional[str] = None,
+        user_default_group: Optional[str] = None,
+        admin_emails: Optional[list] = None,
+        password_policy: Optional[dict] = None,
+        sms_message: Optional[str] = None,
+        email_message: Optional[str] = None,
+        email_subject: Optional[str] = None,
         invitation_only: bool = True,
         allow_alias_sign_in: bool = False,
         enable_mfa: bool = False,
@@ -105,77 +110,35 @@ class AuthorizationAPI(pulumi.ComponentResource):
     ):
         super().__init__("cloud_foundry:api:SecurityAPI", name, {}, opts)
 
-        if user_pool_id:
-            user_pool = aws.cognito.UserPool.get(user_pool_id)
-        else:
-            user_pool = self.create_user_pool(
-                name,
-                attributes=attributes,
-                groups=groups,
-                password_policy=password_policy,
-                email_message=email_message,
-                email_subject=email_subject,
-                invitation_only=invitation_only,
-                allow_alias_sign_in=allow_alias_sign_in,
-            )
-
-        self.create_user_groups(user_pool, groups)
-            
-        if not client_id or not client_secret:
-            user_pool_client = aws.cognito.UserPoolClient(
-                f"{name}-auto-client",
-                name=cloud_foundry.resource_id(f"{name}-auto-client"),
-                user_pool_id=user_pool.id,
-                generate_secret=True,
-                explicit_auth_flows=[
-                    "ALLOW_USER_PASSWORD_AUTH",
-                    "ALLOW_REFRESH_TOKEN_AUTH",
-                    "ALLOW_USER_SRP_AUTH",
-                ],
-                opts=pulumi.ResourceOptions(parent=self),
-            )
-            client_id = user_pool_client.id
-            client_secret = user_pool_client.client_secret
-
-        # Fetch user pool attributes using boto3, using apply to handle Pulumi Output
-        def fetch_attributes(user_pool_id):
-            cognito_client = boto3.client("cognito-idp")
-            user_pool_desc = cognito_client.describe_user_pool(UserPoolId=user_pool_id)
-            pool_attributes = user_pool_desc["UserPool"]["SchemaAttributes"]
-            def convert_schema(attr):
-                return {
-                    "name": attr["Name"],
-                    "attribute_data_type": attr.get("AttributeDataType", "String"),
-                    "required": attr.get("Required", False),
-                    "mutable": attr.get("Mutable", True),
-                    "string_constraints": attr.get("StringAttributeConstraints", {}),
-                }
-            return [convert_schema(a) for a in pool_attributes]
-
-        attributes_from_pool = user_pool.id.apply(fetch_attributes)
+        user_pool = AuthorizationUsers(
+            f"{name}-users",
+            attributes=attributes or default_attributes,
+            groups=groups or default_groups,
+            password_policy=password_policy or default_password_policy,
+            email_message=email_message,
+            email_subject=email_subject,
+            user_pool_id=user_pool_id,
+            client_id=client_id or "",
+        )
 
         client_secret_param = self.create_client_secret_param(
             name,
-            client_id,
-            user_pool.id,
-            client_secret,
-            user_pool.endpoint,
-            user_admin_group or "admin",
-            user_default_group or "user",
-            admin_emails or [],
-            attributes_from_pool,
+            client_id=user_pool.client_id,
+            user_pool_id=user_pool.id,
+            client_secret=user_pool.client_secret,
+            user_pool_endpoint=user_pool.endpoint,
+            user_admin_group=user_admin_group or "admin",
+            user_default_group=user_default_group or "user",
+            admin_emails=admin_emails or [],
+            attributes=attributes or default_attributes,
         )
 
         # Security Lambda
-        self.security_function = cloud_foundry.python_function(
-            "security-function",
-            sources={"app.py": f"{package_dir}/authorization_lambda.py"},
-            environment={
-                "CONFIG_PARAMETER": client_secret_param.name
-            },
-            requirements=["pyjwt", "requests", "cryptography"],
-            policy_statements=[
-                {
+        # Create policy statements using Pulumi apply to handle Outputs
+        def create_security_function(args):
+            user_pool_arn, client_secret_param_arn = args
+            policy_statements = [
+                json.dumps({
                     "Effect": "Allow",
                     "Actions": [
                         "cognito-idp:SignUp",
@@ -191,27 +154,56 @@ class AuthorizationAPI(pulumi.ComponentResource):
                         "cognito-idp:AdminUpdateUserAttributes",
                         "cognito-idp:GetJWKS",
                     ],
-                    "Resources": [ user_pool.arn ],
-                }
-            ],
-            opts=pulumi.ResourceOptions(parent=self),
-        )
+                    "Resources": [user_pool_arn],
+                }),
+                json.dumps({
+                    "Effect": "Allow",
+                    "Actions": [
+                        "ssm:GetParameter"
+                    ],
+                    "Resources": [client_secret_param_arn],
+                })
+            ]
+            return cloud_foundry.python_function(
+                "security-function",
+                sources={"app.py": f"{package_dir}/authorization_lambda.py"},
+                environment={
+                    "CONFIG_PARAMETER": client_secret_param.name,
+                    "ADMIN_EMAILS": json.dumps(admin_emails or []),
+                },
+                requirements=["pyjwt", "requests", "cryptography"],
+                policy_statements=policy_statements,
+                opts=pulumi.ResourceOptions(parent=self),
+            )
 
-        # Token Validator Lambda
-        self.token_validator = cloud_foundry.python_function(
-            "token-validator",
-            sources={"app.py": f"{package_dir}/validator_lambda.py"},
-            requirements=["pyjwt", "requests", "cryptography"],
-            environment={"ISSUER": user_pool.endpoint},
-            opts=pulumi.ResourceOptions(parent=self),
-        )
+        self.security_function = pulumi.Output.all(user_pool.arn, client_secret_param.arn).apply(create_security_function)
 
+        # Load and create OpenAPI specification editor
+        spec_path = os.path.join(os.path.dirname(__file__), "authorization_api.yaml")
+        api_specification = cloud_foundry.OpenAPISpecEditor(spec_path)
+
+        # Create ValidationFunction which handles both path roles extraction and token validator creation
+        # We need to use pulumi.Output.apply to handle the dynamic user_pool.endpoint
+        def create_validator(endpoint):
+            return ValidationFunction(
+                name="token-validator",
+                api_specification=api_specification,
+                user_pool_endpoint=endpoint,
+                validator_name="auth",
+                opts=pulumi.ResourceOptions(parent=self)
+            )
+
+        # Apply the ValidationFunction creation with the user pool endpoint
+        self.validation_function = user_pool.endpoint.apply(create_validator)
+        
+        # Extract the token_validator from the ValidationFunction
+        self.token_validator = self.validation_function.apply(lambda vf: vf.token_validator)
         
         # REST API
         self.api = cloud_foundry.rest_api(
             "security-api",
             logging=True,
-            specification=self.build_api(enable_mfa),
+            specification=self.build_api(api_specification, enable_mfa),
             token_validators=[
                 {
                     "type": "token_validator",
@@ -227,55 +219,28 @@ class AuthorizationAPI(pulumi.ComponentResource):
         )
 
         self.domain = self.api.domain
-        self.token_validator = self.token_validator
         self.user_pool_id = user_pool.id
 
         self.register_outputs(
             {
                 "domain": self.api.domain,
-                "token_validator": self.token_validator.function_name,
                 "user_pool_id": user_pool.id,
             }
         )
 
-    def create_user_groups(self, user_pool, name, groups=None):
-        """
-        Create user groups in the specified user pool.
-        """
-        for group in groups or default_groups:
-            # Validate group structure
-            if not isinstance(group, dict) or "role" not in group or "description" not in group:
-                raise ValueError("Each group must be a dictionary with 'role' and 'description' keys.")
-            
-            # Create User Pool Groups with specified names and descriptions
-            existing_groups = aws.cognito.get_user_groups(user_pool_id=user_pool.id)
-            if any(g.name == group["role"] for g in existing_groups.groups):
-                log.info(f"User group '{group['role']}' already exists in user pool '{user_pool.id}'. Skipping creation.")
-                continue
-            aws.cognito.UserGroup(
-                f"{name}-{group['role']}-group",
-                user_pool_id=user_pool.id,
-                name=group["role"],
-                description=group["description"],
-                opts=pulumi.ResourceOptions(parent=self),
-            )
-
-
-        return user_pool
-    
     def create_client_secret_param(self, name, client_id, user_pool_id, client_secret, user_pool_endpoint, user_admin_group, user_default_group, admin_emails, attributes):
-        def serialize_config(client_id_value, user_pool_id_value, client_secret_value, user_pool_endpoint):
+        def serialize_config(client_id_value, user_pool_id_value, client_secret_value, user_pool_endpoint, attributes):
             # Create the JSON configuration
             config = {
-                "CLIENT_ID": client_id_value,
-                "USER_POOL_ID": user_pool_id_value,
-                "CLIENT_SECRET": client_secret_value,
-                "ISSUER": user_pool_endpoint,
-                "LOGGING_LEVEL": "DEBUG",
-                "USER_ADMIN_GROUP": user_admin_group,
-                "USER_DEFAULT_GROUP": user_default_group,
-                "ADMIN_EMAILS": admin_emails or [],
-                "ATTRIBUTES": json.dumps(attributes)
+                "client_id": client_id_value,
+                "user_pool_id": user_pool_id_value,
+                "client_secret": client_secret_value,
+                "issuer": user_pool_endpoint,
+                "logging_level": "DEBUG",
+                "user_admin_group": user_admin_group,
+                "user_default_group": user_default_group,
+                "admin_emails": admin_emails or [],
+                "attributes": attributes
             }
             return json.dumps(config)
 
@@ -284,7 +249,8 @@ class AuthorizationAPI(pulumi.ComponentResource):
             client_id, 
             user_pool_id,
             client_secret,
-            user_pool_endpoint
+            user_pool_endpoint,
+            attributes
         ).apply(lambda values: serialize_config(*values))
 
         log.info(f"Client secret configuration: {config_output}")
@@ -297,89 +263,34 @@ class AuthorizationAPI(pulumi.ComponentResource):
             opts=pulumi.ResourceOptions(parent=self),
         )
 
-    def create_user_pool(self, name, attributes=None, groups=None, password_policy=None, email_message=None, email_subject=None, invitation_only=True, allow_alias_sign_in=False):
-        # Create Cognito User Pool with custom attributes
-
-        schemas = self.build_schemas(attributes)
-        log.debug(f"schemas: {schemas}")
-
-        admin_create_user_config= {
-            "allow_admin_create_user_only": invitation_only,
-            "invite_message_template": {
-                "email_subject": email_subject or "Welcome to our service",
-                "email_message": email_message or "You have been invited to join our service. Please click the link below to set your password and complete your registration:\n{##Invite Link##}",  # noqa e501
-            }
-        }
-        # Set sign-in alias attributes based on allow_alias_sign_in
-        alias_attributes = []
-        if allow_alias_sign_in:
-            alias_attributes = ["email", "phone_number"]
-
-        # Add alias_attributes to user pool config if needed
-        user_pool_config = {
-            "auto_verified_attributes": ["email"],
-            "alias_attributes": alias_attributes if alias_attributes else None,
-            "schemas": schemas,
-            "password_policy": password_policy or default_password_policy,
-            "admin_create_user_config": admin_create_user_config,
-            "verification_message_template": {
-            "default_email_option": "CONFIRM_WITH_LINK",
-            "email_message_by_link": email_message or "Click the link below to verify your email address:\n{##Verify Email##}",
-            "email_subject_by_link": email_subject or "Verify your email",
-            },
-            "email_configuration": {"email_sending_account": "COGNITO_DEFAULT"},
-            "opts": pulumi.ResourceOptions(parent=self),
-        }
-        # Remove None values to avoid Pulumi errors
-        user_pool_config = {k: v for k, v in user_pool_config.items() if v is not None}
-        user_pool = aws.cognito.UserPool(
-            f"{name}-user-pool",
-            name=cloud_foundry.resource_id(name),
-            auto_verified_attributes=["email"],  # Auto-verify emails
-            schemas=schemas,
-            password_policy=password_policy or default_password_policy,
-            admin_create_user_config={
-                "allow_admin_create_user_only": invitation_only,
-                "invite_message_template": {
-                    "email_subject": email_subject or "Welcome to our service",
-                    "email_message": email_message or "You have been invited to join our service. Please click the link below to set your password and complete your registration:\n{##Invite Link##}",  # noqa e501
-                },
-            },
-            verification_message_template={
-                "default_email_option": "CONFIRM_WITH_LINK",
-                "email_message_by_link": email_message or "Click the link below to verify your email address:\n{##Verify Email##}",  # noqa e501
-                "email_subject_by_link": email_subject or "Verify your email",
-            },
-            email_configuration={"email_sending_account": "COGNITO_DEFAULT"},
-            opts=pulumi.ResourceOptions(parent=self),
-        )
-        log.info(f"Created user pool {user_pool.id} with attributes: {schemas}")
-
-    def build_api(self, enable_mfa, allow_alias_sign_in=False):
-        # Load the OpenAPI specification as a string
-        with open(f"{package_dir}/authorization_api.yaml", "r") as spec_file:
-            api_specification = spec_file.read()
+    def build_api(self, api_specification: cloud_foundry.OpenAPISpecEditor, enable_mfa, allow_alias_sign_in=False):
+        # Clone the OpenAPI specification to avoid mutating the original
+        # This prevents race conditions and allows the original to be used elsewhere
+        import copy
+        api_spec_copy = cloud_foundry.OpenAPISpecEditor(copy.deepcopy(api_specification.openapi_spec))
         
-        # Optionally edit the OpenAPI spec before deploying the API
-        api_specification = cloud_foundry.OpenAPISpecEditor(api_specification)
+        # Remove any roles from the security instances in the OpenAPI specification
+        # The gateway doesn't accept custom validators with role arrays
+        self._remove_roles_from_security_schemes(api_spec_copy)
+        
         if enable_mfa:
-            api_specification.set(['paths', "/sessions", "post", "200", "content", "application/json", "schema", "$ref" ], "#/components/schemas/MfaResponse")
+            api_spec_copy.set(['paths', "/sessions", "post", "responses", "200", "content", "application/json", "schema", "$ref" ], "#/components/schemas/MfaResponse")
         else:
-            api_specification.prune(['components', 'schemas', 'MFARequest'])
-            api_specification.prune(['components', 'schemas', 'MfaResponse'])
-            api_specification.prune(['paths', "/sessions/mfa"])
+            api_spec_copy.prune(['components', 'schemas', 'MFARequest'])
+            api_spec_copy.prune(['components', 'schemas', 'MfaResponse'])
+            api_spec_copy.prune(['paths', "/sessions/mfa"])
 
         if allow_alias_sign_in:
             # Add 'email' and 'phone_number' properties to the sign-in request schema
-            api_specification.set(
+            api_spec_copy.set(
                 ['components', 'schemas', 'SignInRequest', 'properties', 'email'],
                 {"type": "string", "format": "email"}
             )
-            api_specification.set(
+            api_spec_copy.set(
                 ['components', 'schemas', 'SignInRequest', 'properties', 'phone_number'],
                 {"type": "string", "pattern": "^\\+?[1-9]\\d{1,14}$"}
             )
-        return api_specification
+        return api_spec_copy.to_yaml()
 
     def build_integrations(self, security_function, enable_mfa: bool = False) -> list:  
         # Define the integrations for the API
@@ -391,8 +302,50 @@ class AuthorizationAPI(pulumi.ComponentResource):
             "auth": True,
             },
             {
+            "path": "/users/confirm",
+            "method": "POST",
+            "function": security_function,
+            "auth": False,
+            },
+            {
             "path": "/users/{username}",
             "method": "GET",
+            "function": security_function,
+            "auth": True,
+            },
+            {
+            "path": "/users/{username}",
+            "method": "DELETE",
+            "function": security_function,
+            "auth": True,
+            },
+            {
+            "path": "/users/me",
+            "method": "GET",
+            "function": security_function,
+            "auth": True,
+            },
+            {
+            "path": "/users/me/password",
+            "method": "PUT",
+            "function": security_function,
+            "auth": True,
+            },
+            {
+            "path": "/users/{username}/groups",
+            "method": "PUT",
+            "function": security_function,
+            "auth": True,
+            },
+            {
+            "path": "/users/{username}/disable",
+            "method": "POST",
+            "function": security_function,
+            "auth": True,
+            },
+            {
+            "path": "/users/{username}/enable",
+            "method": "POST",
             "function": security_function,
             "auth": True,
             },
@@ -401,6 +354,18 @@ class AuthorizationAPI(pulumi.ComponentResource):
             "method": "POST",
             "function": security_function,
             "auth": False,
+            },
+            {
+            "path": "/sessions/me",
+            "method": "DELETE",
+            "function": security_function,
+            "auth": True,
+            },
+            {
+            "path": "/sessions/refresh",
+            "method": "POST",
+            "function": security_function,
+            "auth": True,
             },
         ]
         if enable_mfa:
@@ -412,20 +377,33 @@ class AuthorizationAPI(pulumi.ComponentResource):
                 })
         return integrations
 
-    def build_schemas(self, attributes):
+
+    def _remove_roles_from_security_schemes(self, api_specification: cloud_foundry.OpenAPISpecEditor):
         """
-        Build the schemas for the user pool attributes.
+        Remove any roles from security schemes in the OpenAPI specification.
+        AWS API Gateway doesn't accept custom validators with role arrays in security requirements.
         """
-        schemas = []
-        for attr in attributes or default_attributes:
-            if attr["name"] not in predefined_attributes:
-                schemas.append({
-                    "name": attr["name"],
-                    "attribute_data_type": "String",
-                    "required": attr.get("required", False),
-                    "mutable": attr.get("mutable", True),
-                    "string_constraints": attr.get("string_constraints", {}),
-                })
-            else:
-                log.warning(f"Attribute '{attr['name']}' is a predefined attribute and will be ignored.")
-        return schemas
+        # Get all paths from the specification
+        path_items = api_specification.get_spec_part(['paths'])
+        
+        if not isinstance(path_items, dict):
+            log.warning("OpenAPI spec 'paths' is not a dictionary. Skipping roles removal.")
+            return
+            
+        # Iterate through all paths and operations
+        for path, path_item in path_items.items():
+            if isinstance(path_item, dict):
+                for method, operation in path_item.items():
+                    if isinstance(operation, dict) and 'security' in operation:
+                        security_requirements = operation.get('security', [])
+                        
+                        # Modify each security requirement to remove role arrays
+                        for security_req in security_requirements:
+                            if isinstance(security_req, dict):
+                                for validator_name in security_req:
+                                    # Clear the roles array but keep the validator
+                                    security_req[validator_name] = []
+                        
+                        log.debug(f"Cleared roles from security requirements for {method.upper()} {path}")
+        
+        log.info("Removed all roles from security schemes for API Gateway compatibility")

@@ -22,21 +22,6 @@ ADMIN_USER = f"apitestadmin_{uuid.uuid4()}@example.com"
 
 def user_pool_pulumi():
     def pulumi_program():
-        """
-        Defines a Pulumi program to provision an authorization user pool and securely store its configuration.
-
-        This function performs the following actions:
-        1. Defines user attributes for the user pool (e.g., "nickName").
-        2. Creates an `AuthorizationUsers` resource representing a user pool with specified attributes and user groups ("admin", "manager", "member").
-        3. Logs the successful creation of the security API and user pool.
-        4. Creates an AWS SSM Parameter Store entry to securely store the user pool's configuration, including client ID, user pool ID, client secret, issuer endpoint, logging level, admin group, default group, admin emails, and attributes.
-        5. Exports the name of the created SSM parameter for use in other Pulumi stacks or outputs.
-
-        Note:
-            - The function assumes the existence of `AuthorizationUsers`, `aws`, `cloud_foundry`, `json`, `log`, and `ADMIN_USER` in the scope.
-            - The "username" attribute is commented out and not included in the user pool attributes.
-        """
-
         attributes=[
             {
             "name": "email",
@@ -617,3 +602,64 @@ def test_refresh_token_invalid(authorization_services):
     )
     response = authorization_services.handler(event, None)
     assert response["statusCode"] == 400 or response["statusCode"] == 401
+
+
+def test_disable_enable_user(authorization_services):
+    email = f"apitestmember_{uuid.uuid4()}@example.com"
+    member_payload = {
+        "username": email,
+        "email": email,
+        "password": "InitialPass123!",
+        "phone_number": "+12065550110",
+    }
+    with member_user(authorization_services, member_payload) as member:
+        with admin_user(authorization_services) as admin:
+            with user_session(authorization_services, admin["username"], admin["password"]) as (access_token, _):
+                # Disable the user
+                event = make_event(
+                    path="/users/{username}/disable",
+                    method="POST",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    path_parameters={"username": urllib.parse.quote(member["username"])},
+                    authorizer_context={"permissions": ["admin"]},
+                )
+                response = authorization_services.handler(event, None)
+                assert response["statusCode"] == 200
+                assert "disabled" in json.loads(response["body"])["message"]
+
+            # Wait for eventual consistency after disabling the user
+            sleep(10)
+
+            # Attempt to login as the disabled user (should fail)
+            event = make_event(
+                path="/sessions",
+                method="POST",
+                body={"username": member["username"], "password": member["password"]},
+            )
+            response = authorization_services.handler(event, None)
+            assert response["statusCode"] != 200
+
+            with user_session(authorization_services, admin["username"], admin["password"]) as (access_token, _):
+                # Enable the user
+                event = make_event(
+                    path="/users/{username}/enable",
+                    method="POST",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    path_parameters={"username": urllib.parse.quote(member["username"])},
+                    authorizer_context={"permissions": ["admin"]},
+                )
+                response = authorization_services.handler(event, None)
+                assert response["statusCode"] == 200
+                assert "enabled" in json.loads(response["body"])["message"]
+
+            # Wait for eventual consistency after disabling the user
+            sleep(10)
+
+            # Attempt to login as the enabled user (should succeed)
+            event = make_event(
+                path="/sessions",
+                method="POST",
+                body={"username": member["username"], "password": member["password"]},
+            )
+            response = authorization_services.handler(event, None)
+            assert response["statusCode"] == 200

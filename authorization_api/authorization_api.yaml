@@ -7,6 +7,7 @@ paths:
   /users:
     post:
       summary: Create a new user (signup)
+      description: Register a new user account by providing a username, password, and email address.
       requestBody:
         required: true
         content:
@@ -31,13 +32,13 @@ paths:
               schema:
                 type: object
                 properties:
-                  error:
+                  message:
                     type: string
                     example: An error occurred
   /users/confirm:
     post:
       summary: Confirm user signup
-      description: Confirm a user's signup using a confirmation code.
+      description: Verify a user's registration by submitting the confirmation code sent to their email or phone.
       requestBody:
         required: true
         content:
@@ -78,9 +79,9 @@ paths:
   /users/{username}:
     get:
       summary: Get user info (admin only)
-      description: Retrieve information about the specified user. Admin only.
+      description: Retrieve detailed information about a specific user. Accessible only to administrators.
       security:
-        - auth: []
+        - auth: ['admin']
       parameters:
         - name: username
           in: path
@@ -118,9 +119,9 @@ paths:
                     example: User not found
     delete:
       summary: Remove the user
-      description: Remove the user identified by the username.
+      description: Permanently delete a user account identified by the username. Admin access required.
       security:
-        - auth: []
+        - auth: [ 'admin']
       parameters:
         - name: username
           in: path
@@ -128,7 +129,7 @@ paths:
           schema:
             type: string
       responses:
-        '200':
+        '204':
           description: User removal successful
           content:
             application/json:
@@ -151,9 +152,9 @@ paths:
   /users/me:
     get:
       summary: Get authenticated user info
-      description: Retrieve information about the currently authenticated user.
+      description: Retrieve profile information for the currently authenticated user.
       security:
-        - auth: []
+        - auth: ['user']
       responses:
         '200':
           description: User information retrieved successfully
@@ -168,38 +169,12 @@ paths:
                   email:
                     type: string
                     example: johndoe@example.com
-    delete:
-      summary: Remove the authenticated user
-      description: Remove the currently authenticated user.
-      security:
-        - auth: []
-      responses:
-        '200':
-          description: User removal successful
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: User removed successfully
-        '400':
-          description: User removal failed
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: An error occurred
   /users/me/password:
     put:
       summary: Change password for the authenticated user
-      description: Change the password for the user identified by the authentication token.
+      description: Update the password for the authenticated user by providing the current and new passwords.
       security:
-        - auth: []
+        - auth: ['user']
       requestBody:
         required: true
         content:
@@ -237,9 +212,9 @@ paths:
   /users/{username}/groups:
     put:
       summary: Replace all groups for a user
-      description: Replace the group memberships for the specified user. Admin only.
+      description: Set the complete list of group memberships for a user. Only administrators can perform this action.
       security:
-        - auth: []
+        - auth: [ 'admin' ]
       parameters:
         - name: username
           in: path
@@ -279,9 +254,77 @@ paths:
                   message:
                     type: string
                     example: Update failed
+  /users/{username}/disable:
+    post:
+      summary: Disable a user account (admin only)
+      description: Temporarily deactivate a user account, preventing login and access. Admin access required.
+      security:
+        - auth: [ 'admin' ]
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User disabled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: User disabled successfully
+        '400':
+          description: Failed to disable user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Failed to disable user
+
+  /users/{username}/enable:
+    post:
+      summary: Enable a user account (admin only)
+      description: Reactivate a previously disabled user account. Admin access required.
+      security:
+        - auth: [ 'admin' ]
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User enabled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: User enabled successfully
+        '400':
+          description: Failed to enable user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Failed to enable user
   /sessions:
     post:
       summary: Login (create a session)
+      description: Authenticate a user and create a new session, returning access and refresh tokens.
       requestBody:
         required: true
         content:
@@ -308,8 +351,9 @@ paths:
   /sessions/me:
     delete:
       summary: Logout (delete a session)
+      description: Invalidate the current session and log out the authenticated user.
       security:
-        - auth: []
+        - auth: ['user']
       responses:
         '204':
           description: Logout successful
@@ -326,7 +370,9 @@ paths:
   /sessions/refresh:
     post:
       summary: Refresh tokens
-      description: Refresh the access token and optionally the refresh token using the provided refresh token.
+      description: Obtain new access and refresh tokens using a valid refresh token.
+      security:
+        - auth: ['user']
       requestBody:
         required: true
         content:
@@ -353,7 +399,7 @@ paths:
   /sessions/mfa:
     post:
       summary: Respond to MFA challenge
-      description: Submit the MFA code received via SMS or authenticator app.
+      description: Submit a multi-factor authentication (MFA) code to complete the login process.
       requestBody:
         required: true
         content:
@@ -467,11 +513,3 @@ components:
         id_token:
           type: string
           example: eyJraWQiOiJr...
-        refresh_token:
-          type: string
-          example: eyJraWQiOiJr...
-        groups:
-          type: array
-          items:
-            type: string
-          example: ["admin", "user"]

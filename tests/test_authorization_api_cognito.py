@@ -9,25 +9,32 @@ from tests.automation_helpers import deploy_stack, deploy_stack_no_teardown
 from typing import Dict
 import boto3
 import contextlib
-from authorization_api import AuthorizationAPI, AuthorizationUsers
 
 log = logging.getLogger(__name__)
 dotenv.load_dotenv()
 
-admin_user_email = f"apitestadmin_{uuid.uuid4()}@example.com"
+ADMIN_USER = f"apitestadmin_{uuid.uuid4()}@example.com"
 
 def security_services_pulumi():
     def pulumi_program():
+        from authorization_api import AuthorizationAPI
 
         security_api = AuthorizationAPI(
-            "security-api",
+            "authorization-api",
             invitation_only=False,
-            admin_emails=[admin_user_email])
+            user_admin_group="admin",
+            user_default_group="member",
+            admin_emails=[ADMIN_USER],
+            groups=[
+                {"description": "Admins group", "role": "admin"},
+                {"description": "Manager group", "role": "manager"},
+                {"description": "Member group", "role": "member"},
+            ],
+        )
 
         log.info("Security API and User Pool created successfully.")
         pulumi.export("security-user-pool-id", security_api.user_pool_id)
         pulumi.export("security-api-host", security_api.domain)
-        pulumi.export("token-validator", security_api.token_validator.function_name)
 
     return pulumi_program
 
@@ -35,19 +42,17 @@ def security_services_pulumi():
 @pytest.fixture(scope="module")
 def security_services_stack():
     log.info("Starting deployment of security services stack")
-    yield from deploy_stack("authorization-api", "test", security_services_pulumi())
+    yield from deploy_stack("auth-api", "test", security_services_pulumi())
 
 
 @pytest.fixture(scope="module")
 def domain(security_services_stack):
-    log.info("Setting up domain fixture")
     stack, outputs = security_services_stack
     yield f"https://{outputs.get('security-api-host').value}"
 
 
 @pytest.fixture(scope="module")
 def user_pool_id(security_services_stack):
-    log.info("Setting up domain fixture")
     stack, outputs = security_services_stack
     yield outputs.get("security-user-pool-id").value
 
@@ -57,46 +62,22 @@ def unique_user_payload():
     return {
         "username": unique_email,
         "password": "InitialPass123!",
-        "email": unique_email
+        "phone_number": "+12065550100",
+        "email": unique_email,
     }
 
 
 def create_user(domain, member_payload):
     log.info(f"Creating user with payload: {member_payload}, domain:{domain}")
     response = requests.post(f"{domain}/users", json=member_payload)
-    if response.status_code == 400 and "already exists" in response.text.lower():
-        # User already exists, try to delete and recreate
-        login_payload = {
-            "username": member_payload["username"],
-            "password": member_payload["password"],
-            "email": member_payload["username"],
-        }
-        login_resp = requests.post(f"{domain}/sessions", json=login_payload)
-        if login_resp.ok:
-            tokens = login_resp.json()
-            headers = {"Authorization": f"Bearer {tokens['access_token']}"}
-            requests.delete(f"{domain}/users/me", headers=headers)
-        # Try again
-        response = requests.post(f"{domain}/users", json=member_payload)
-    if not response.ok:
-        log.error(f"Failed to create user: {response.status_code} - {response.text}")
-        response.raise_for_status()
     return response
 
 
 def delete_user(domain, username, access_token):
-    log.info(
-        f"Deleting user: {username} with access token: {access_token}, domain:{domain}"
-    )
+    log.info(f"Deleting user: {username} with access token: {access_token}, domain:{domain}")
 
     headers = {"Authorization": f"Bearer {access_token}"}
-    # Use /users/me if deleting the current user, otherwise use the username
-    if username == "me":
-        url = f"{domain}/users/me "
-    else:
-        url = f"{domain}/users/{urllib.parse.quote(username)}"
-
-    log.info(f"Delete user URL: {url}")
+    url = f"{domain}/users/me" if username == "me" else f"{domain}/users/{urllib.parse.quote(username)}"
     response = requests.delete(url, headers=headers)
     log.info(f"Delete user response: {response.status_code} - {response.text}")
     if not response.ok:
@@ -106,9 +87,9 @@ def delete_user(domain, username, access_token):
 
 
 @contextlib.contextmanager
-def member_user(domain, user_pool_id):
+def member_user(domain, user_pool_id, member_payload=None):
     log.info(f"Setting up member user, domain:{domain}")
-    member_payload = unique_user_payload()
+    member_payload = member_payload or unique_user_payload()
     create_user(domain, member_payload)
     try:
         log.info(f"Member user created: {member_payload['username']}, domain:{domain}")
@@ -124,11 +105,13 @@ def member_user(domain, user_pool_id):
 
 
 @contextlib.contextmanager
-def admin_user(domain, user_pool_id):
+def admin_user(domain, user_pool_id, admin_email=None):
+    admin_email = admin_email or ADMIN_USER
     admin_payload = {
-        "username": admin_user_email,
+        "username": admin_email,
         "password": "AdminPass1234!",
-        "email": admin_user_email
+        "phone_number": "+12065550101",
+        "email": admin_email,
     }
 
     create_user(domain, admin_payload)
@@ -136,21 +119,21 @@ def admin_user(domain, user_pool_id):
         f"Creating admin user: {admin_payload['username']} in user pool: {user_pool_id}"
     )
 
-    # Add user to admin group
-    client = boto3.client("cognito-idp")
-    client.admin_add_user_to_group(
-        UserPoolId=user_pool_id, Username=admin_payload["username"], GroupName="admin"
-    )
-
-    yield admin_payload
-
-    # Cleanup: delete the user
     try:
-        client.admin_delete_user(
-            UserPoolId=user_pool_id, Username=admin_payload["username"]
-        )
-    except Exception:
-        pass
+        yield admin_payload
+    finally:
+        with user_session(domain, admin_payload["username"], admin_payload["password"]) as (
+            access_token,
+            _,
+        ):
+            delete_user
+        # Cleanup: delete the user
+        try:
+            client.admin_delete_user(
+                UserPoolId=user_pool_id, Username=admin_payload["username"]
+            )
+        except Exception:
+            pass
 
 
 @contextlib.contextmanager
@@ -185,13 +168,6 @@ def user_session(domain, username, password):
 
 
 def test_admin_session(domain, user_pool_id):
-    with admin_user(domain, user_pool_id) as admin:
-        with user_session(domain, admin["username"], admin["password"]) as (
-            access_token,
-            _,
-        ):
-            assert access_token is not None
-
     with admin_user(domain, user_pool_id) as admin:
         with user_session(domain, admin["username"], admin["password"]) as (
             access_token,
@@ -325,3 +301,18 @@ def test_refresh_token(domain, user_pool_id):
                 requests.delete(f"{domain}/users/me", headers=headers)
             except Exception:
                 pass
+
+
+@pytest.fixture(scope="module")
+def admin_user_fixture(domain, user_pool_id):
+    admin_payload = {
+        "username": ADMIN_USER,
+        "password": "AdminPass1234!",
+        "phone_number": "+12065550101",
+        "email": ADMIN_USER,
+    }
+    create_user(domain, admin_payload)
+    yield admin_payload
+    # Cleanup: delete the admin user after all tests
+    with user_session(domain, admin_payload["username"], admin_payload["password"]) as (access_token, _):
+        delete_user(domain, admin_payload["username"], access_token)

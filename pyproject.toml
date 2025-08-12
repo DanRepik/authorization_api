@@ -1,5 +1,6 @@
-# src/pyproject.toml
-
+# pyproject.toml
+[tool.flit.sdist]
+include = ["authorization_api.yaml"]
 [build-system]
 requires = ["flit-core>=3.2"]
 build-backend = "flit_core.buildapi"

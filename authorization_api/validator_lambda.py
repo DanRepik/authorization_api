@@ -2,8 +2,10 @@ import os
 import json
 import re
 import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError
 import requests
 import logging
+from typing import Dict, Any, List
 
 log = logging.getLogger(__name__)
 log.setLevel(os.environ.get("LOGGING_LEVEL", "DEBUG"))
@@ -16,15 +18,21 @@ DEFAULT_ARN = "arn:aws:execute-api:*:*:*/*/*/*"
 ISSUER = os.getenv(
     "ISSUER"
 )  # expected format: https://cognito-idp.<region>.amazonaws.com/<user_pool_id>
-
+PATH_ROLES = json.loads(os.getenv("PATH_ROLES", "{}"))
 
 def handler(event, context):
+    log.debug(f"PATH_ROLES keys: {list(PATH_ROLES.keys())}")
     """Main Lambda handler."""
     log.info(event)
     try:
         token = parse_token_from_event(check_event_for_error(event))
         decoded_token = decode_token(event, token)
         log.info(f"Decoded token: {decoded_token}")
+        
+        # Check role-based authorization if PATH_ROLES are configured
+        if PATH_ROLES:
+            check_path_authorization(event["methodArn"], decoded_token)
+        
         policy = get_policy(
             event["methodArn"],
             decoded_token,
@@ -32,7 +40,7 @@ def handler(event, context):
         )
         log.info(f"Generated policy: {json.dumps(policy)}")
         return policy
-    except jwt.InvalidTokenError as e:
+    except (ExpiredSignatureError, InvalidTokenError) as e:
         log.error(f"Token validation failed: {e}")
         return {
             "statusCode": 401,
@@ -44,6 +52,74 @@ def handler(event, context):
             "statusCode": 500,
             "body": json.dumps({"message": "Internal Server Error", "error": str(e)}),
         }
+
+
+def check_path_authorization(method_arn: str, decoded_token: Dict[str, Any]) -> None:
+    """
+    Enforce PATH_ROLES: keys are 'METHOD /path'
+    """
+    try:
+        # methodArn: arn:aws:execute-api:region:acct:apiId/stage/METHOD/path/parts
+        arn_parts = method_arn.split("/", 3)
+        if len(arn_parts) < 4:
+            log.debug(f"Unexpected methodArn format: {method_arn}")
+            return
+        method = arn_parts[2].upper()
+        resource_path = "/" + arn_parts[3] if len(arn_parts) > 3 else "/"
+        # Normalize double slashes
+        resource_path = re.sub(r"//+", "/", resource_path)
+
+        # Build keys
+        request_key = f"{method} {resource_path}"
+        user_roles = set(
+            decoded_token.get("permissions", [])
+            or decoded_token.get("cognito:groups", [])
+            or []
+        )
+
+        # Exact or templated match
+        required = None
+        if request_key in PATH_ROLES:
+            required = PATH_ROLES[request_key]
+        else:
+            # template fallback
+            for pattern_key, roles in PATH_ROLES.items():
+                pmeth, ppath = pattern_key.split(" ", 1)
+                if pmeth == method and path_matches(ppath, resource_path):
+                    required = roles
+                    break
+
+        if required:
+            if not user_roles.intersection(required):
+                log.warning(f"Authorization failed. Need one of {required}, user has {user_roles}")
+                raise Exception("Forbidden")
+        # If no required roles found, pass (unprotected operation as per extracted map)
+    except Exception:
+        raise
+
+
+def path_matches(pattern_path: str, actual_path: str) -> bool:
+    """
+    Check if an actual path matches a pattern path.
+    Supports basic path parameter matching with {param} syntax.
+    
+    Args:
+        pattern_path: Path pattern like "/users/{username}"
+        actual_path: Actual request path like "/users/john"
+        
+    Returns:
+        bool: True if the paths match
+    """
+    # Simple exact match first
+    if pattern_path == actual_path:
+        return True
+    
+    # Convert pattern to regex for parameter matching
+    # Replace {param} with [^/]+ to match any non-slash characters
+    pattern_regex = re.sub(r'\{[^}]+\}', r'[^/]+', pattern_path)
+    pattern_regex = f"^{pattern_regex}$"
+    
+    return bool(re.match(pattern_regex, actual_path))
 
 
 def check_event_for_error(event: dict) -> dict:
@@ -104,42 +180,62 @@ def build_policy_resource_base(event: dict) -> str:
     return ":".join(arn_pieces)
 
 
-def decode_token(event, token: str) -> dict:
+def decode_token(event, token: str) -> Dict[str, Any]:
     """
     Validate and decode the JWT token using the public key from the Cognito User Pool.
     """
     log.info("Decoding token")
 
-    # Get the public keys from Cognito (could be improved with dynamic key fetching)
-    jwks_url = f"{ISSUER}/.well-known/jwks.json"
+    # Normalize the issuer URL
+    if not ISSUER:
+        raise Exception("ISSUER environment variable is not set.")
+    if not ISSUER.startswith("https://"):
+        issuer_url = f"https://{ISSUER}"
+    else:
+        issuer_url = ISSUER
+
+    # Get the public keys from Cognito
+    jwks_url = f"{issuer_url}/.well-known/jwks.json"
+    log.info(f"Fetching JWKS from {jwks_url}")
     response = requests.get(jwks_url)
     if response.status_code != 200:
         raise Exception(f"Error fetching JWKS: {response.text}")
 
     jwks = response.json()
 
-    # Load the public key corresponding to the token's kid
+    # Get the token header to find the key ID
     header = jwt.get_unverified_header(token)
-    key = next(k for k in jwks["keys"] if k["kid"] == header["kid"])
-    public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
+    
+    # Find the matching key
+    key = None
+    for k in jwks["keys"]:
+        if k["kid"] == header["kid"]:
+            key = k
+            break
+    
+    if not key:
+        raise Exception(f"Unable to find matching key for kid: {header.get('kid')}")
+    
+    # Create the RSA public key from the JWK
+    from jwt.algorithms import RSAAlgorithm
+    
+    public_key = RSAAlgorithm.from_jwk(json.dumps(key))
 
-    log.info(f"Public key: {public_key}")
+    log.info("Public key loaded successfully")
 
-    audience = event["methodArn"].rstrip("/").split(":")[-1].split("/")[1]
-    log.info(f"Audience: {audience}")
     try:
         # Decode and verify the JWT token
         decoded_token = jwt.decode(
             token,
-            public_key,
+            public_key,  # type: ignore
             algorithms=["RS256"],
-            issuer=ISSUER,
+            issuer=issuer_url,  # Use the normalized URL
         )
         return decoded_token
-    except jwt.ExpiredSignatureError:
+    except ExpiredSignatureError:
         log.error("Token has expired.")
-        raise jwt.InvalidTokenError("Token has expired.")
-    except jwt.InvalidTokenError as e:
+        raise
+    except InvalidTokenError as e:
         log.error(f"Token validation failed: {e}")
         raise
 
@@ -165,7 +261,7 @@ def get_policy(method_arn: str, decoded: dict, is_ws: bool) -> dict:
     }
 
 
-def create_statement(effect: str, resource: list, action: list) -> dict:
+def create_statement(effect: str, resource: str, action: str) -> Dict[str, Any]:
     """Create a policy statement."""
     return {
         "Effect": effect,
