@@ -39,7 +39,7 @@ def handler(event, context):
     # Handle regular API Gateway requests
     auth_service = AuthorizationServices()
     result = auth_service.handler(event, context)
-    log.info(f"Handler result: {result}")
+    log.debug(f"Handler result: {json.dumps(result)}")
     return result
 
 
@@ -54,7 +54,7 @@ class AuthorizationServices:
             log.info("Loading configuration from Parameter Store")
             # Load the configuration from AWS SSM Parameter Store
             config = load_configuration(client_config_name or os.environ.get("CONFIG_PARAMETER"))
-            log.info(f"Configuration loaded: {config}")
+            log.debug(f"Configuration loaded: {json.dumps(config)}")
 
         self.user_pool_id = os.getenv("USER_POOL_ID") or config.get("user_pool_id")
         self.client_id = os.getenv("CLIENT_ID") or config.get("client_id")
@@ -74,11 +74,13 @@ class AuthorizationServices:
         self.attributes = config.get("attributes", None)
 
     def handler(self, event, context):
-        log.info(f"Received event: {event}")
+        log.debug(f"Received event: {json.dumps(event)}")
 
         path = event.get("resource", "")
         http_method = event.get("httpMethod", "").upper()
-        log.info(f"Path: {path}, HTTP Method: {http_method}")
+        username = self._extract_username(event)
+        
+        log.info(f"API: {http_method} {path} | User: {username or 'anonymous'}")
 
         if path.endswith("/users") and http_method == "POST":
             return self.create_user(event)
@@ -86,6 +88,8 @@ class AuthorizationServices:
             return self.get_user(event)
         elif path.endswith("/users/confirm") and http_method == "POST":
             return self.confirm_user(event)
+        elif path.endswith("/users/{username}/confirm") and http_method == "POST":
+            return self.admin_confirm_user(event)
         elif path.endswith("/users/{username}") and http_method == "DELETE":
             return self.delete_user(event)
         elif path.endswith("/users/me/password") and http_method == "PUT":
@@ -103,19 +107,49 @@ class AuthorizationServices:
         elif path.endswith("/sessions/refresh") and http_method == "POST":
             return self.refresh_session(event)
         else:
+            log.warning(f"Invalid action: {http_method} {path}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": "Invalid action or method"}),
             }
 
+    def _extract_username(self, event):
+        """Extract username from event for logging purposes"""
+        # Try to get from authorizer context
+        try:
+            if event.get("requestContext") and event["requestContext"].get("authorizer") and event["requestContext"]["authorizer"].get("username"):
+                return event["requestContext"]["authorizer"]["username"]
+        except (KeyError, TypeError, AttributeError):
+            pass
+    
+        # Try to get from path parameters - handle None case properly
+        try:
+            path_params = event.get("pathParameters")
+            if path_params and path_params.get("username"):
+                username = path_params["username"]
+                if username != "me":
+                    return unquote(username)
+        except (KeyError, TypeError, AttributeError):
+            pass
+    
+        # Try to get from body
+        try:
+            if event.get("body"):
+                body = json.loads(event["body"])
+                if body:
+                    return body.get("username") or body.get("email")
+        except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
+            pass
+        
+        return None
+
     def create_user(self, event):
         body = json.loads(event["body"])
-        log.info(f"body: {body}")
+        log.debug(f"Request body: {json.dumps(body)}")
         username = body.get("username") or body.get("email")
         password = body.get("password")
 
         try:
-
             # Compile UserAttributes from the body using self.attributes
             user_attributes = []
             missing_required = []
@@ -128,29 +162,30 @@ class AuthorizationServices:
                 if value is not None:
                     user_attributes.append({"Name": attr_name, "Value": str(value)})
             if missing_required:
+                log.warning(f"User creation failed: Missing required attributes: {', '.join(missing_required)}")
                 return {
                     "statusCode": 400,
                     "body": json.dumps({"message": f"Missing required attributes: {', '.join(missing_required)}"}),
                 }
 
+            # Create the user with a temporary password
             cognito_client.admin_create_user(
                 UserPoolId=self.user_pool_id,
                 Username=username,
                 UserAttributes=user_attributes,
                 TemporaryPassword=password,
-                MessageAction="SUPPRESS",
             )
-
-            # Set the user's password to a permanent one
+            # Set the user's password but keep them in an unconfirmed state
             cognito_client.admin_set_user_password(
                 UserPoolId=self.user_pool_id,
                 Username=username,
                 Password=password,
-                Permanent=True,
+                Permanent=False,  # Set to False to keep user unconfirmed
             )
+
             # Add user to default group if self.user_default_group is set
             if self.user_default_group:
-                log.info(f"Adding user {username} to group {self.user_default_group}")
+                log.debug(f"Adding user {username} to group {self.user_default_group}")
                 cognito_client.admin_add_user_to_group(
                     UserPoolId=self.user_pool_id,
                     Username=username,
@@ -160,63 +195,62 @@ class AuthorizationServices:
             # Add user to admin group if their email is in admin_emails
             user_email = body.get("email") or username
             if self.user_admin_group and user_email and self.admin_emails and user_email in self.admin_emails:
-                log.info(f"Adding user {username} to admin group {self.user_admin_group}")
+                log.debug(f"Adding user {username} to admin group {self.user_admin_group}")
                 cognito_client.admin_add_user_to_group(
                     UserPoolId=self.user_pool_id,
                     Username=username,
                     GroupName=self.user_admin_group,
                     )
 
-            log.info(f"User {username} created successfully")
+            log.info(f"USER: Created user {username} (needs confirmation) | Groups: {self.user_default_group or 'none'} | Admin: {'yes' if user_email in self.admin_emails else 'no'}")
             # Return a success response                
             return {
                 "statusCode": 201,
-                "body": json.dumps({"message": "Signup successful"}),
+                "body": json.dumps({"message": "Signup successful, but user needs confirmation"}),
             }
         except ClientError as e:
-            log.error(f"Error creating user: {e.response}")
+            log.error(f"User creation failed: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
             }
 
     def get_user(self, event):
-        log.info("Getting user")
         permissions = self.get_permissions_from_token(
             event["requestContext"]["authorizer"]
         )
-        log.info(f"permissions: {permissions}")
+        log.debug(f"User permissions: {permissions}")
         # Check if admin group is defined and user is an admin
         if self.user_admin_group:
             if self.user_admin_group not in permissions:
+                log.info(f"USER: Access denied | Reason: Missing admin permission")
                 return {
                     "statusCode": 403,
                     "body": json.dumps(
-                        {"message": "You are not authorized to delete users"}
+                        {"message": "You are not authorized to view user details"}
                     ),
                 }
 
         username = unquote(event["pathParameters"]["username"])
-        log.info(f"username: {username}")
         try:
             user_info, groups = self.fetch_user_info(username)
-            log.info(f"user_info: {user_info}")
+            log.info(f"USER: Retrieved details for {username} | Groups: {', '.join(groups)}")
             return {
                 "statusCode": 200,
                 "body": json.dumps({"user_info": user_info, "groups": groups}),
             }
         except ClientError as e:
+            log.error(f"Error retrieving user details: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
             }
 
     def delete_user(self, event):
-        log.info("Deleting user")
         permissions = self.get_permissions_from_token(
             event["requestContext"]["authorizer"]
         )
-        log.info(f"permissions: {permissions}")
+        log.debug(f"User permissions: {permissions}")
         username = event["pathParameters"]["username"]
         try:
             # If username is 'me', get the actual username from the authorizer
@@ -227,29 +261,30 @@ class AuthorizationServices:
         except Exception:
             # If decoding fails, just use the original username
             pass
-        log.info(f"username: {username}")
-
+        
         # Check if admin group is defined and user is an admin
         if self.user_admin_group:
             if self.user_admin_group not in permissions:
+                log.info(f"USER: Delete denied for {username} | Reason: Missing admin permission")
                 return {
                     "statusCode": 403,
                     "body": json.dumps(
                         {"message": "You are not authorized to delete users"}
                     ),
                 }
-        log.info(f"Deleting user: {username}")
+        
         try:
             cognito_client.admin_delete_user(
                 UserPoolId=self.user_pool_id,
                 Username=username,
             )
+            log.info(f"USER: Deleted {username}")
             return {
                 "statusCode": 200,
                 "body": json.dumps({"message": "User deleted successfully"}),
             }
         except ClientError as e:
-            log.error(f"Error deleting user: {e.response}")
+            log.error(f"Error deleting user: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
@@ -258,15 +293,28 @@ class AuthorizationServices:
     def change_user_password(self, event):
         body = json.loads(event["body"])
         request_context = event.get("requestContext")
-        log.info(f"request_context: {request_context}")
-        log.info(f"body: {body}")
+        log.debug(f"Request context: {json.dumps(request_context)}")
         username = request_context.get("authorizer", {}).get("username")
         old_password = body.get("old_password")
         new_password = body.get("new_password")
 
-        log.info(
-            f"Changing password for user: {username}, old_password: {old_password}, new_password: {new_password}"
-        )
+        log.debug(f"Changing password for user: {username}")
+        
+        # Check if both old_password and new_password are provided
+        if not old_password:
+            log.info(f"USER: Password change failed for {username} | Reason: Missing old password")
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": "Old password is required"})
+            }
+        
+        if not new_password:
+            log.info(f"USER: Password change failed for {username} | Reason: Missing new password")
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": "New password is required"})
+            }
+
         try:
             # Authenticate the user with the old password to verify it is correct
             secret_hash = self.calculate_secret_hash(username)
@@ -280,10 +328,10 @@ class AuthorizationServices:
                 ClientId=self.client_id,
             )
         except ClientError as e:
-            log.error(f"Old password verification failed: {e.response}")
+            log.info(f"USER: Password change failed for {username} | Reason: Old password incorrect")
             return {
                 "statusCode": 400,
-                "body": json.dumps({"message": "Old password is incorrect"}),
+                "body": json.dumps({"message": "Old password is incorrect"})
             }
 
         try:
@@ -293,12 +341,14 @@ class AuthorizationServices:
                 Password=new_password,
                 Permanent=True,
             )
-
+            
+            log.info(f"USER: Password changed for {username}")
             return {
                 "statusCode": 200,
                 "body": json.dumps({"message": "Password changed successfully"}),
             }
         except ClientError as e:
+            log.error(f"Error changing password: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
@@ -308,28 +358,31 @@ class AuthorizationServices:
         permissions = self.get_permissions_from_token(
             event["requestContext"]["authorizer"]
         )
-        log.info(f"permissions: {permissions}")
+        log.debug(f"User permissions: {permissions}")
         # Check if admin group is defined and user is an admin
         if self.user_admin_group:
             if self.user_admin_group not in permissions:
+                log.info(f"USER: Group change denied | Reason: Missing admin permission")
                 return {
                     "statusCode": 403,
                     "body": json.dumps(
-                        {"message": "You are not authorized to delete users"}
+                        {"message": "You are not authorized to modify user groups"}
                     ),
                 }
 
         username = unquote(event["pathParameters"]["username"])
         body = json.loads(event["body"])
-        log.info(f"body: {body}")
         groups = body.get("groups", [])
 
         try:
             current_groups = set(self.fetch_user_info(username)[1])
             new_groups = set(groups)
+            
+            removed_groups = current_groups - new_groups
+            added_groups = new_groups - current_groups
 
             # Remove user from groups they are no longer in
-            for group in current_groups - new_groups:
+            for group in removed_groups:
                 cognito_client.admin_remove_user_from_group(
                     UserPoolId=self.user_pool_id,
                     Username=username,
@@ -337,18 +390,20 @@ class AuthorizationServices:
                 )
 
             # Add user to new groups they are not already in
-            for group in new_groups - current_groups:
+            for group in added_groups:
                 cognito_client.admin_add_user_to_group(
                     UserPoolId=self.user_pool_id,
                     Username=username,
                     GroupName=group,
                 )
 
+            log.info(f"USER: Updated groups for {username} | Added: {', '.join(added_groups) or 'none'} | Removed: {', '.join(removed_groups) or 'none'}")
             return {
                 "statusCode": 200,
                 "body": json.dumps({"message": "User groups updated successfully"}),
             }
         except ClientError as e:
+            log.error(f"Error changing user groups: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
@@ -357,26 +412,25 @@ class AuthorizationServices:
     def create_session(self, event):
         # Log all the request headers
         headers = event.get("headers", {})
-        log.info(f"Request headers: {headers}")
+        log.debug(f"Request headers: {json.dumps(headers)}")
         body = json.loads(event["body"])
-        log.info(f"body: {body}")
         username = body.get("username") or body.get("email")
-        password = body.get("password")
         secret_hash = self.calculate_secret_hash(username)
 
         try:
-            log.info(f"username: {username}")
+            log.debug(f"Authenticating user: {username}")
             response = cognito_client.initiate_auth(
                 AuthFlow="USER_PASSWORD_AUTH",
                 AuthParameters={
                     "USERNAME": username,
-                    "PASSWORD": password,
+                    "PASSWORD": body.get("password"),
                     "SECRET_HASH": secret_hash,
                 },
                 ClientId=self.client_id,
             )
-
+            log.debug(f"Authentication response: {response}")
             user_info, groups = self.fetch_user_info(username)
+            log.info(f"SESSION: Created for {username} | Groups: {', '.join(groups)}")
             return {
                 "statusCode": 200,
                 "body": json.dumps(
@@ -392,19 +446,78 @@ class AuthorizationServices:
                 ),
             }
         except ClientError as e:
-            log.error(f"Error: {e.response}")
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"message": e.response["Error"]["Message"]}),
-            }
+            error_code = e.response.get('Error', {}).get('Code', '')
+            error_message = e.response.get('Error', {}).get('Message', '')
+            
+            # Handle specific error cases
+            if error_code == "NotAuthorizedException" and "not confirmed" in error_message.lower():
+                # User exists but is not confirmed
+                log.info(f"SESSION: Login failed for {username} | Reason: User not confirmed")
+                return {
+                    "statusCode": 401,
+                    "body": json.dumps({
+                        "message": "User is not confirmed. Please check your email for a confirmation link or contact an administrator.",
+                        "error_code": "USER_NOT_CONFIRMED",
+                        "username": username
+                    }),
+                }
+            elif error_code == "UserNotConfirmedException":
+                # Explicit error code for unconfirmed users
+                log.info(f"SESSION: Login failed for {username} | Reason: User not confirmed")
+                return {
+                    "statusCode": 401,
+                    "body": json.dumps({
+                        "message": "User is not confirmed. Please check your email for a confirmation link or contact an administrator.",
+                        "error_code": "USER_NOT_CONFIRMED",
+                        "username": username
+                    }),
+                }
+            elif error_code == "UserNotFoundException":
+                # User doesn't exist
+                log.info(f"SESSION: Login failed for {username} | Reason: User not found")
+                return {
+                    "statusCode": 401,
+                    "body": json.dumps({
+                        "message": "Incorrect username or password",
+                        "error_code": "INVALID_CREDENTIALS"
+                    }),
+                }
+            elif error_code == "NotAuthorizedException" and "incorrect username or password" in error_message.lower():
+                # Invalid credentials
+                log.info(f"SESSION: Login failed for {username} | Reason: Invalid credentials")
+                return {
+                    "statusCode": 401,
+                    "body": json.dumps({
+                        "message": "Incorrect username or password",
+                        "error_code": "INVALID_CREDENTIALS"
+                    }),
+                }
+            elif error_code == "UserNotFoundError":
+                # User doesn't exist (different error code)
+                log.info(f"SESSION: Login failed for {username} | Reason: User not found")
+                return {
+                    "statusCode": 401,
+                    "body": json.dumps({
+                        "message": "Incorrect username or password",
+                        "error_code": "INVALID_CREDENTIALS"
+                    }),
+                }
+            else:
+                # Generic error handling
+                log.info(f"SESSION: Login failed for {username} | Reason: {error_message}")
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"message": error_message}),
+                }
 
     def delete_session(self, event):
         try:
             headers = event.get("headers", {})
             authorization_header = headers.get("Authorization")
+            username = event["requestContext"]["authorizer"].get("username", "unknown")
 
             if not authorization_header:
-                log.error("Authorization header is missing")
+                log.warning("Logout attempt without Authorization header")
                 return {
                     "statusCode": 400,
                     "body": json.dumps({"message": "Authorization header is required"}),
@@ -417,24 +530,28 @@ class AuthorizationServices:
             )
 
             if not access_token:
+                log.info(f"SESSION: Logout successful for {username} (no token)")
                 return {
                     "statusCode": 200,
                     "body": json.dumps({"message": "Logout successful"}),
                 }
 
             response = cognito_client.global_sign_out(AccessToken=access_token)
-            log.info(f"Logout response: {response}")
+            log.debug(f"Logout response: {response}")
             if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
-                log.error("Logout failed")
+                log.warning(f"SESSION: Logout failed for {username}")
                 return {
                     "statusCode": 400,
                     "body": json.dumps({"message": "Logout failed"}),
                 }
+                
+            log.info(f"SESSION: Logout successful for {username}")
             return {
                 "statusCode": 200,
                 "body": json.dumps({"message": "Logout successful"}),
             }
         except ClientError as e:
+            log.error(f"Error during logout: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
@@ -442,18 +559,20 @@ class AuthorizationServices:
 
     def calculate_secret_hash(self, username):
         message = username + self.client_id
-        secret_hash = hmac.new(
-            self.client_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+        digest = hmac.new(
+            key=self.client_secret.encode("utf-8"), 
+            msg=message.encode("utf-8"), 
+            digestmod=hashlib.sha256
         ).digest()
-        return base64.b64encode(secret_hash).decode("utf-8")
+        return base64.b64encode(digest).decode("utf-8")
 
     def refresh_session(self, event):
-        log.info("Starting refresh_token function")
+        log.debug("Starting refresh_token function")
         body = json.loads(event["body"])
 
         refresh_token = body.get("refresh_token")
         if not refresh_token:
-            log.info("Refresh token is missing in the request")
+            log.warning("Refresh token is missing in the request")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": "Refresh token is required"}),
@@ -462,32 +581,28 @@ class AuthorizationServices:
         username = event["requestContext"]["authorizer"].get("username")
 
         try:
-            log.info("Attempting to use the refresh token to get new tokens")
+            log.debug("Attempting to use the refresh token to get new tokens")
             # Use the refresh token to get new tokens
-            secret_hash = self.calculate_secret_hash(
-                username
-            )  # Calculate the secret hash
+            secret_hash = self.calculate_secret_hash(username)
             response = cognito_client.initiate_auth(
                 AuthFlow="REFRESH_TOKEN_AUTH",
                 AuthParameters={
                     "REFRESH_TOKEN": refresh_token,
-                    "SECRET_HASH": secret_hash,  # Include the secret hash
+                    "SECRET_HASH": secret_hash,
                 },
                 ClientId=self.client_id,
             )
-            log.info(f"InitiateAuth response: {response}")
+            log.debug(f"InitiateAuth response status: {response['ResponseMetadata']['HTTPStatusCode']}")
 
             # Extract tokens from the response
             access_token = response["AuthenticationResult"]["AccessToken"]
             id_token = response["AuthenticationResult"]["IdToken"]
             new_refresh_token = response["AuthenticationResult"].get(
                 "RefreshToken", refresh_token
-            )  # Use the new refresh token if provided
-            log.info(f"Access token: {access_token}")
-            log.info(f"ID token: {id_token}")
-            log.info(f"Refresh token: {new_refresh_token}")
+            )
 
             user_info, groups = self.fetch_user_info(username)
+            log.info(f"SESSION: Refreshed for {username} | Groups: {', '.join(groups)}")
 
             return {
                 "statusCode": 200,
@@ -502,13 +617,13 @@ class AuthorizationServices:
                 ),
             }
         except ClientError as e:
-            log.error(f"ClientError occurred: {e.response}")
+            log.info(f"SESSION: Refresh failed for {username} | Reason: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
             }
         except Exception as e:
-            log.error(f"Unexpected error occurred: {str(e)}")
+            log.error(f"Unexpected error occurred during token refresh: {str(e)}")
             return {
                 "statusCode": 500,
                 "body": json.dumps({"message": "An unexpected error occurred"}),
@@ -524,13 +639,14 @@ class AuthorizationServices:
             for attr in user_details.get("UserAttributes", [])
         }
         enabled = user_details.get("Enabled", False)
-        log.info(f"User attributes: {attributes}, Enabled: {enabled}")
+        log.debug(f"User attributes: {json.dumps(attributes)}, Enabled: {enabled}")
+        
         # Get the user's groups
         user_groups = cognito_client.admin_list_groups_for_user(
             UserPoolId=self.user_pool_id, Username=username
         )
         groups = [group["GroupName"] for group in user_groups.get("Groups", [])]
-        log.info(f"User groups: {groups}")
+        log.debug(f"User groups: {groups}")
 
         # Include enabled status in the returned attributes
         attributes["enabled"] = enabled
@@ -572,22 +688,39 @@ class AuthorizationServices:
         confirmation_code = body.get("confirmation_code")
 
         if not username or not confirmation_code:
+            log.warning(f"User confirmation failed: Missing username or confirmation code")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": "Username and confirmation code are required"}),
             }
 
         try:
+            # For client-side confirmation, we need to include the secret hash
+            secret_hash = self.calculate_secret_hash(username)
+            
             cognito_client.confirm_sign_up(
                 ClientId=self.client_id,
                 Username=username,
                 ConfirmationCode=confirmation_code,
+                SecretHash=secret_hash,
             )
+            
+            # After confirmation, we can set the password as permanent if needed
+            # This step is optional - depends on your requirements
+            cognito_client.admin_set_user_password(
+                UserPoolId=self.user_pool_id,
+                Username=username,
+                Password=body.get("password", ""),  # If a new password is provided
+                Permanent=True,
+            ) if body.get("password") else None
+            
+            log.info(f"USER: Confirmed {username}")
             return {
                 "statusCode": 200,
                 "body": json.dumps({"message": "User confirmed successfully"}),
             }
         except ClientError as e:
+            log.info(f"USER: Confirmation failed for {username} | Reason: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
@@ -597,22 +730,27 @@ class AuthorizationServices:
         permissions = self.get_permissions_from_token(
             event["requestContext"]["authorizer"]
         )
+        username = unquote(event["pathParameters"]["username"])
+        
         if self.user_admin_group and self.user_admin_group not in permissions:
+            log.info(f"USER: Disable denied for {username} | Reason: Missing admin permission")
             return {
                 "statusCode": 403,
                 "body": json.dumps({"message": "You are not authorized to disable users"}),
             }
-        username = unquote(event["pathParameters"]["username"])
+        
         try:
             cognito_client.admin_disable_user(
                 UserPoolId=self.user_pool_id,
                 Username=username,
             )
+            log.info(f"USER: Disabled {username}")
             return {
                 "statusCode": 200,
                 "body": json.dumps({"message": "User disabled successfully"}),
             }
         except ClientError as e:
+            log.error(f"Error disabling user: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
@@ -622,24 +760,58 @@ class AuthorizationServices:
         permissions = self.get_permissions_from_token(
             event["requestContext"]["authorizer"]
         )
+        username = unquote(event["pathParameters"]["username"])
+        
         if self.user_admin_group and self.user_admin_group not in permissions:
+            log.info(f"USER: Enable denied for {username} | Reason: Missing admin permission")
             return {
                 "statusCode": 403,
                 "body": json.dumps({"message": "You are not authorized to enable users"}),
             }
-        username = unquote(event["pathParameters"]["username"])
+        
         try:
             cognito_client.admin_enable_user(
                 UserPoolId=self.user_pool_id,
                 Username=username,
             )
+            log.info(f"USER: Enabled {username}")
             return {
                 "statusCode": 200,
                 "body": json.dumps({"message": "User enabled successfully"}),
             }
         except ClientError as e:
+            log.error(f"Error enabling user: {e.response['Error']['Message']}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({"message": e.response["Error"]["Message"]}),
             }
-    
+            
+    def admin_confirm_user(self, event):
+        permissions = self.get_permissions_from_token(
+            event["requestContext"]["authorizer"]
+        )
+        username = unquote(event["pathParameters"]["username"])
+        
+        if self.user_admin_group and self.user_admin_group not in permissions:
+            log.info(f"USER: Confirm denied for {username} | Reason: Missing admin permission")
+            return {
+                "statusCode": 403,
+                "body": json.dumps({"message": "You are not authorized to confirm users"}),
+            }
+        
+        try:
+            cognito_client.admin_confirm_sign_up(
+                UserPoolId=self.user_pool_id,
+                Username=username,
+            )
+            log.info(f"USER: Admin confirmed {username}")
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "User confirmed successfully"}),
+            }
+        except ClientError as e:
+            log.error(f"Error confirming user: {e.response['Error']['Message']}")
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": e.response["Error"]["Message"]}),
+            }

@@ -350,6 +350,12 @@ class AuthorizationAPI(pulumi.ComponentResource):
             "auth": True,
             },
             {
+            "path": "/users/{username}/confirm",
+            "method": "POST",
+            "function": security_function,
+            "auth": True,
+            },
+            {
             "path": "/sessions",
             "method": "POST",
             "function": security_function,

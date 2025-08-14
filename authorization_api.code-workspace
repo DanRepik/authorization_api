@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../cloud_foundry"
+		},
+		{
+			"path": "../farm_market"
+		},
+		{
+			"path": "../api_foundry"
+		}
+	],
+	"settings": {}
+}
