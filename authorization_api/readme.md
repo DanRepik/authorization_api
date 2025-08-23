@@ -12,6 +12,8 @@ This API provides endpoints for user authentication, authorization, and manageme
 **Create a new user (signup)**  
 Register a new user account by providing a username, password, and email address.
 
+The contents of the request body are determined by the attributes defined in your API's user model when you deploy the API. For example, if your user model specifies username, password, and email as required fields, these will be expected in the request body for user registration. This ensures that the API enforces the correct data structure based on your application's current user definition.
+
 **Request Body:**  
 - `username` (string, required)  
 - `password` (string, required)  
@@ -69,16 +71,6 @@ Retrieve profile information for the currently authenticated user.
 
 **Responses:**  
 - `200`: User information retrieved successfully
-
----
-
-#### `DELETE /users/me`
-**Remove the authenticated user (admin only)**  
-Delete the account of the currently authenticated user. Admin access required.
-
-**Responses:**  
-- `204`: User removal successful  
-- `400`: User removal failed
 
 ---
 
@@ -175,12 +167,12 @@ Obtain new access and refresh tokens using a valid refresh token.
 - `id_token` (string, optional)
 
 **Responses:**  
-- `200`: Token refresh successful  
+- `200`: Token refresh successful (returns the same shape as LoginResponse)  
 - `400`: Token refresh failed
 
 ---
 
-#### `POST /sessions/mfa`
+#### `POST /sessions/mfa` (available when MFA is enabled)
 **Respond to MFA challenge**  
 Submit a multi-factor authentication (MFA) code to complete the login process.
 
@@ -197,50 +189,51 @@ Submit a multi-factor authentication (MFA) code to complete the login process.
 
 ## Schemas
 
-### SignupRequest
-```yaml
-username: string
-password: string
-email: string
-```
-
-### LoginRequest
-```yaml
-username: string
-password: string
-```
-
-### LoginResponse
-```yaml
-id_token: string
-access_token: string
-refresh_token: string
-```
-
-### MfaResponse
-```yaml
-challenge_name: string
-session: string
-message: string
-```
-
-### MfaChallengeResponse
-```yaml
-username: string
-session: string
-code: string
-```
-
-### RefreshTokenRequest
-```yaml
-username: string
-refresh_token: string
-access_token: string (optional)
-id_token: string (optional)
-```
-
 ---
 
-**Note:**  
-Some endpoints require admin privileges. Authentication is typically handled via bearer tokens (JWT).  
-For full schema details, refer to the OpenAPI YAML file.
+## Authentication and Roles
+
+This API uses a token validator. Endpoints require either:
+- user: any authenticated user
+- admin: a user in the Cognito group "admin"
+
+Role requirements (selected):
+- admin: GET/DELETE /users/{username}, PUT /users/{username}/groups, POST /users/{username}/disable|enable
+- user: GET /users/me, DELETE /sessions/me, POST /sessions/refresh
+- public: POST /users, POST /users/confirm, POST /sessions
+
+Example Authorization header
+
+```http
+Authorization: Bearer <access_token>
+```
+
+Example admin JWT payload (truncated)
+
+```json
+{
+	"sub": "...",
+	"cognito:groups": ["admin", "user"],
+	"iss": "https://cognito-idp.<region>.amazonaws.com/<userPoolId>",
+	"token_use": "access",
+	"exp": 1730000000
+}
+```
+
+Example calls
+
+```bash
+# As any authenticated user
+curl -H "Authorization: Bearer $ACCESS_TOKEN" \
+	"$API_BASE/users/me"
+
+# Admin-only: remove a user
+curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+	"$API_BASE/users/alice"
+
+# Admin-only: replace groups
+curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+	-d '{"groups": ["admin", "user"]}' \
+	"$API_BASE/users/bob/groups"
+```
+

@@ -151,7 +151,7 @@ def admin_user(domain, user_pool_id):
         )
     except Exception:
         pass
-
+        pass
 
 @contextlib.contextmanager
 def user_session(domain, username, password):
@@ -231,7 +231,7 @@ def test_delete_user(domain, user_pool_id):
         log.info(f"Expected error when logging in deleted user: {e}")
 
 
-def test_change_password(domain, user_pool_id):
+def test_change_password_missing_old(domain, user_pool_id):
     # loggin the user an change the password
     with member_user(domain, user_pool_id) as member:
         with user_session(domain, member["username"], member["password"]) as (
@@ -242,6 +242,49 @@ def test_change_password(domain, user_pool_id):
 
             # Change password
             change_payload = {"new_password": "NewPass456!"}
+            response = requests.put(
+                f"{domain}/users/me/password", json=change_payload, headers=headers
+            )
+            assert (
+                response.status_code == 400
+            ), f"Expected 400 status code, got {response.status_code}: {response.text}"
+            data = response.json()
+            assert "message" in data
+            assert data["message"] == "Both old_password and new_password are required"
+            log.info(f"Password change failed as expected for user {member['username']}")
+
+        with user_session(domain, member["username"], "NewPass456!") as (
+            access_token,
+            refresh_token,
+        ):
+            assert access_token is not None
+
+
+def test_change_password(domain, user_pool_id):
+    # loggin the user an change the password
+    with member_user(domain, user_pool_id) as member:
+        with user_session(domain, member["username"], member["password"]) as (
+            access_token,
+            _,
+        ):
+            headers = {"Authorization": f"Bearer {access_token}"}
+
+            # Attempt to change password without old_password
+            change_payload = {"new_password": "NewPass456!"}
+            response = requests.put(
+                f"{domain}/users/me/password", json=change_payload, headers=headers
+            )
+            assert (
+                response.status_code == 400
+            ), f"Expected 400 status code, got {response.status_code}: {response.text}"
+            data = response.json()
+            assert "message" in data
+            assert data["message"] == "Both old_password and new_password are required"
+            log.info(f"Password change failed as expected for user {member['username']}")
+
+
+            # Change password
+            change_payload = {"new_password": "NewPass456!", "old_password": member["password"]}
             response = requests.put(
                 f"{domain}/users/me/password", json=change_payload, headers=headers
             )

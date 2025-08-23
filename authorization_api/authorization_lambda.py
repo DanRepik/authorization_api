@@ -62,6 +62,9 @@ class AuthorizationServices:
         self.user_admin_group = os.getenv("USER_ADMIN_GROUP") or config.get("user_admin_group")
         self.user_default_group = os.getenv("USER_DEFAULT_GROUP") or config.get("user_default_group")
         self.admin_emails = os.getenv("ADMIN_EMAILS")
+        self.user_verification = (
+            os.getenv("USER_VERIFICATION", str(config.get("user_verification", True))).lower() == "true"
+        )
         if self.admin_emails:
             self.admin_emails = json.loads(self.admin_emails)
         else:
@@ -133,21 +136,30 @@ class AuthorizationServices:
                     "body": json.dumps({"message": f"Missing required attributes: {', '.join(missing_required)}"}),
                 }
 
-            cognito_client.admin_create_user(
-                UserPoolId=self.user_pool_id,
-                Username=username,
-                UserAttributes=user_attributes,
-                TemporaryPassword=password,
-                MessageAction="SUPPRESS",
-            )
+            if self.user_verification:
+                # Create user with temporary password, email will be sent for confirmation
+                cognito_client.admin_create_user(
+                    UserPoolId=self.user_pool_id,
+                    Username=username,
+                    UserAttributes=user_attributes,
+                    TemporaryPassword=password,
+                )
+            else:
+                # Create user with permanent password, suppress email
+                cognito_client.admin_create_user(
+                    UserPoolId=self.user_pool_id,
+                    Username=username,
+                    UserAttributes=user_attributes,
+                    TemporaryPassword=password,
+                    MessageAction="SUPPRESS",
+                )
+                cognito_client.admin_set_user_password(
+                    UserPoolId=self.user_pool_id,
+                    Username=username,
+                    Password=password,
+                    Permanent=True,
+                )
 
-            # Set the user's password to a permanent one
-            cognito_client.admin_set_user_password(
-                UserPoolId=self.user_pool_id,
-                Username=username,
-                Password=password,
-                Permanent=True,
-            )
             # Add user to default group if self.user_default_group is set
             if self.user_default_group:
                 log.info(f"Adding user {username} to group {self.user_default_group}")
@@ -263,6 +275,11 @@ class AuthorizationServices:
         username = request_context.get("authorizer", {}).get("username")
         old_password = body.get("old_password")
         new_password = body.get("new_password")
+        if not old_password or not new_password:
+            return {
+            "statusCode": 400,
+            "body": json.dumps({"message": "Both old_password and new_password are required"}),
+            }
 
         log.info(
             f"Changing password for user: {username}, old_password: {old_password}, new_password: {new_password}"

@@ -53,7 +53,7 @@ class AuthorizationUsers(ComponentResource):
                 name=resource_id(name),
                 auto_verified_attributes=["email"],  # Auto-verify emails
                 schemas=schemas,
-                password_policy=aws.cognito.UserPoolPasswordPolicyArgs(**password_policy) if password_policy is not None else default_password_policy,
+                password_policy=aws.cognito.UserPoolPasswordPolicyArgs(**password_policy) if password_policy is not None else aws.cognito.UserPoolPasswordPolicyArgs(**default_password_policy),
                 admin_create_user_config={
                     # Allow users to sign up themselves
                     "allow_admin_create_user_only": False

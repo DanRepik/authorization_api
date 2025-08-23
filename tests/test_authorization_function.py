@@ -63,6 +63,7 @@ def user_pool_pulumi():
                 "user_admin_group": "admin",
                 "user_default_group": "member",
                 "admin_emails": [ADMIN_USER],
+                "user_verification": False,
                 "attributes": attributes
             })
         )
@@ -101,6 +102,7 @@ def create_user(service, member_payload):
         method="POST",
         body=member_payload
     )
+    # Call the handler to create the user
     return service.handler(event, None)
 
 
@@ -153,14 +155,14 @@ def member_user(service, member_payload=None):
 
 @contextlib.contextmanager
 def admin_user(service):
-    try:
-        admin_payload = {
-            "username": ADMIN_USER,
-            "password": "AdminPass1234!",
-            'email': ADMIN_USER,
-            "phone_number": "+12065550101",  # <-- Add a valid phone number
-        }
+    admin_payload = {
+        "username": ADMIN_USER,
+        "password": "AdminPass1234!",
+        'email': ADMIN_USER,
+        "phone_number": "+12065550101",  # <-- Add a valid phone number
+    }
 
+    try:
         create_user(service, admin_payload)
         log.info(f"Creating admin user: {admin_payload['username']}")
 
@@ -204,6 +206,7 @@ def user_session(service, username, password):
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             # Retry logout up to 5 times due to Cognito eventual consistency
+            response = None
             for attempt in range(5):
                 response = service.handler(event, None)
                 if response["statusCode"] == 200:
@@ -211,7 +214,7 @@ def user_session(service, username, password):
                 log.warning(f"Logout attempt {attempt+1} failed: {response}")
                 sleep(2)
             log.info(f"Logout response: {response}")
-            assert response["statusCode"] == 200
+            assert response is not None and response.get("statusCode") == 200
         log.info(f"User {username} session ended")
 
 
