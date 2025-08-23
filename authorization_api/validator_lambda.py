@@ -8,7 +8,7 @@ import logging
 from typing import Dict, Any, List
 
 log = logging.getLogger(__name__)
-log.setLevel(os.environ.get("LOGGING_LEVEL", "DEBUG"))
+log.setLevel(os.environ.get("LOGGING_LEVEL", "INFO"))  # Default to INFO unless overridden
 
 # Load environment variables
 AUTH_MAPPINGS = json.loads(os.getenv("AUTH0_AUTH_MAPPINGS", "{}"))
@@ -21,53 +21,80 @@ ISSUER = os.getenv(
 PATH_ROLES = json.loads(os.getenv("PATH_ROLES", "{}"))
 
 def handler(event, context):
-    log.debug(f"PATH_ROLES keys: {list(PATH_ROLES.keys())}")
     """Main Lambda handler."""
-    log.info(event)
+    log.debug(f"Received event: {json.dumps(event)}")
+    log.debug(f"PATH_ROLES keys: {list(PATH_ROLES.keys())}")
+    
     try:
         token = parse_token_from_event(check_event_for_error(event))
         decoded_token = decode_token(event, token)
-        log.info(f"Decoded token: {decoded_token}")
+        
+        # Extract user info for logging
+        username = decoded_token.get("username", decoded_token.get("email", decoded_token.get("sub", "unknown")))
+        user_roles = decoded_token.get("permissions", decoded_token.get("cognito:groups", []))
+        log.debug(f"Decoded token for user {username}: {json.dumps(decoded_token)}")
+        
+        # Extract method and path from methodArn
+        method, path = extract_method_path(event["methodArn"])
         
         # Check role-based authorization if PATH_ROLES are configured
+        authorization_result = "ALLOWED (no roles required)"
         if PATH_ROLES:
-            check_path_authorization(event["methodArn"], decoded_token)
+            required_roles = check_path_authorization(event["methodArn"], decoded_token, dry_run=True)
+            if required_roles:
+                check_path_authorization(event["methodArn"], decoded_token)
+                authorization_result = f"ALLOWED (has required role)"
+            else:
+                authorization_result = "ALLOWED (path not restricted)"
+        
+        # Log authorization result at INFO level
+        log.info(f"AUTH: {method} {path} | User: {username} | Result: {authorization_result}")
         
         policy = get_policy(
             event["methodArn"],
             decoded_token,
             "sec-websocket-protocol" in event["headers"],
         )
-        log.info(f"Generated policy: {json.dumps(policy)}")
+        log.debug(f"Generated policy: {json.dumps(policy)}")
         return policy
     except (ExpiredSignatureError, InvalidTokenError) as e:
-        log.error(f"Token validation failed: {e}")
+        method, path = extract_method_path(event.get("methodArn", "unknown"))
+        log.info(f"AUTH: {method} {path} | Result: DENIED (invalid token: {str(e)})")
         return {
             "statusCode": 401,
             "body": json.dumps({"message": "Unauthorized", "error": str(e)}),
         }
     except Exception as e:
-        log.error(f"Authorization error: {e}")
+        method, path = extract_method_path(event.get("methodArn", "unknown"))
+        log.info(f"AUTH: {method} {path} | Result: ERROR ({str(e)})")
+        log.error(f"Authorization error: {e}", exc_info=True)
         return {
             "statusCode": 500,
             "body": json.dumps({"message": "Internal Server Error", "error": str(e)}),
         }
 
 
-def check_path_authorization(method_arn: str, decoded_token: Dict[str, Any]) -> None:
+def extract_method_path(method_arn: str) -> tuple:
+    """Extract HTTP method and path from methodArn."""
+    try:
+        arn_parts = method_arn.split("/", 3)
+        method = arn_parts[2].upper() if len(arn_parts) > 2 else "UNKNOWN"
+        path = "/" + (arn_parts[3] if len(arn_parts) > 3 else "")
+        path = re.sub(r"//+", "/", path)
+        return method, path
+    except Exception:
+        return "UNKNOWN", "UNKNOWN"
+
+
+def check_path_authorization(method_arn: str, decoded_token: Dict[str, Any], dry_run: bool = False) -> List[str]:
     """
     Enforce PATH_ROLES: keys are 'METHOD /path'
+    
+    If dry_run is True, returns the required roles without enforcing authorization.
     """
     try:
         # methodArn: arn:aws:execute-api:region:acct:apiId/stage/METHOD/path/parts
-        arn_parts = method_arn.split("/", 3)
-        if len(arn_parts) < 4:
-            log.debug(f"Unexpected methodArn format: {method_arn}")
-            return
-        method = arn_parts[2].upper()
-        resource_path = "/" + arn_parts[3] if len(arn_parts) > 3 else "/"
-        # Normalize double slashes
-        resource_path = re.sub(r"//+", "/", resource_path)
+        method, resource_path = extract_method_path(method_arn)
 
         # Build keys
         request_key = f"{method} {resource_path}"
@@ -76,39 +103,45 @@ def check_path_authorization(method_arn: str, decoded_token: Dict[str, Any]) -> 
             or decoded_token.get("cognito:groups", [])
             or []
         )
+        log.debug(f"User roles: {user_roles}")
+        log.debug(f"Checking authorization for {request_key}")
 
         # Exact or templated match
         required = None
         if request_key in PATH_ROLES:
             required = PATH_ROLES[request_key]
+            log.debug(f"Found exact match for {request_key}, required roles: {required}")
         else:
             # template fallback
             for pattern_key, roles in PATH_ROLES.items():
                 pmeth, ppath = pattern_key.split(" ", 1)
                 if pmeth == method and path_matches(ppath, resource_path):
                     required = roles
+                    log.debug(f"Found pattern match for {pattern_key}, required roles: {required}")
                     break
+            if not required:
+                log.debug(f"No path role requirement found for {request_key}")
 
         if required:
+            if dry_run:
+                return required
+                
             if not user_roles.intersection(required):
-                log.warning(f"Authorization failed. Need one of {required}, user has {user_roles}")
+                log.info(f"AUTH: {method} {resource_path} | User roles: {user_roles} | Result: DENIED (needs one of {required})")
                 raise Exception("Forbidden")
+            return required
         # If no required roles found, pass (unprotected operation as per extracted map)
-    except Exception:
-        raise
+        return []
+    except Exception as e:
+        if not dry_run:
+            raise
+        return []
 
 
 def path_matches(pattern_path: str, actual_path: str) -> bool:
     """
     Check if an actual path matches a pattern path.
     Supports basic path parameter matching with {param} syntax.
-    
-    Args:
-        pattern_path: Path pattern like "/users/{username}"
-        actual_path: Actual request path like "/users/john"
-        
-    Returns:
-        bool: True if the paths match
     """
     # Simple exact match first
     if pattern_path == actual_path:
@@ -150,16 +183,15 @@ def check_event_for_error(event: dict) -> dict:
 
 def parse_token_from_event(event: dict) -> str:
     """Extract the Bearer token from the authorization header."""
-    log.info("Parsing token from event")
+    log.debug("Parsing token from event")
     auth_token_parts = event["authorizationToken"].split(" ")
-    log.info(f"auth_token_parts: {auth_token_parts}")
+    log.debug(f"Auth token parts count: {len(auth_token_parts)}")
     if (
         len(auth_token_parts) != 2
         or auth_token_parts[0].lower() != "bearer"
         or not auth_token_parts[1]
     ):
         raise Exception("Invalid AuthorizationToken.")
-    log.info(f"token: {auth_token_parts[1]}")
     return auth_token_parts[1]
 
 
@@ -184,7 +216,7 @@ def decode_token(event, token: str) -> Dict[str, Any]:
     """
     Validate and decode the JWT token using the public key from the Cognito User Pool.
     """
-    log.info("Decoding token")
+    log.debug("Decoding token")
 
     # Normalize the issuer URL
     if not ISSUER:
@@ -196,15 +228,26 @@ def decode_token(event, token: str) -> Dict[str, Any]:
 
     # Get the public keys from Cognito
     jwks_url = f"{issuer_url}/.well-known/jwks.json"
-    log.info(f"Fetching JWKS from {jwks_url}")
-    response = requests.get(jwks_url)
+    log.debug(f"Fetching JWKS from {jwks_url}")
+    
+    try:
+        # Peek at the token's issuer without validation for debugging
+        unverified = jwt.decode(token, options={"verify_signature": False})
+        log.debug(f"Token 'iss' claim: {unverified.get('iss')}")
+        log.debug(f"Expected issuer: {issuer_url}")
+    except Exception as e:
+        log.debug(f"Error peeking at token: {e}")
+    
+    response = requests.get(jwks_url, timeout=5)
     if response.status_code != 200:
+        log.error(f"JWKS fetch failed: {response.status_code} {response.text}")
         raise Exception(f"Error fetching JWKS: {response.text}")
 
     jwks = response.json()
 
     # Get the token header to find the key ID
     header = jwt.get_unverified_header(token)
+    log.debug(f"Token header: {json.dumps(header)}")
     
     # Find the matching key
     key = None
@@ -221,7 +264,7 @@ def decode_token(event, token: str) -> Dict[str, Any]:
     
     public_key = RSAAlgorithm.from_jwk(json.dumps(key))
 
-    log.info("Public key loaded successfully")
+    log.debug("Public key loaded successfully")
 
     try:
         # Decode and verify the JWT token
@@ -248,7 +291,7 @@ def get_policy(method_arn: str, decoded: dict, is_ws: bool) -> dict:
         "permissions": ",".join(
             decoded.get("permissions", decoded.get("cognito:groups", []))
         ),
-        "username": decoded.get("username"),
+        "username": decoded.get("username", decoded.get("email", decoded.get("sub", "unknown"))),
     }
 
     return {
